@@ -1,0 +1,103 @@
+# Multishine patch 0022-multishine-autopoke.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/EXI.c b/kernel/EXI.c
+--- a/kernel/EXI.c
++++ b/kernel/EXI.c
+@@ -196,6 +196,8 @@
+ 	IRQ_Cause[2] = 0;
+ }
+ 
++u32 ExiChanTabAddr = 0;   /* */
++
+ /* experiment (/vbba.cfg irqpoke=N): one spurious transfer-complete interrupt for slot 0 through the normal delivery path, only when nobody holds the EXI lock */
+ void EXIPoke(u32 cause)
+ {
+@@ -730,6 +732,11 @@
+ {
+ 	struct exidiag *e = &exiDiagRing[(exiDiagHead - 1 - back) & 63];
+ 	_sprintf( out, "-%ums %02X/%08X/%08X d%u", (now - e->tick) / 1898u, e->w0 >> 24, e->w0, e->w1, e->dev );
++}
++int EXIDiagLastIsCh0Dma( void )
++{
++	const struct exidiag *e = &exiDiagRing[(exiDiagHead - 1) & 63];
++	return exiDiagCmds && (e->w0 >> 24) == 0x12 && (e->w0 & 0x00F00000u) == 0;
+ }
+ void EXIDiagState( u32 *o )
+ {
+diff --git a/kernel/EXI.h b/kernel/EXI.h
+--- a/kernel/EXI.h
++++ b/kernel/EXI.h
+@@ -82,6 +82,9 @@
+ void EXIDiagState( u32 *o );
+ int EXILockTry( void );
+ void EXIPoke( u32 cause );
++extern u32 ExiChanTabAddr;           /* guest address of the EXI channel table the patched EXIDMA uses (0 = not found) */
++extern bool EXI_IRQ;
++int EXIDiagLastIsCh0Dma( void );     /* the newest EXI command the guest posted was a channel 0 DMA */
+ void EXIUnlock( void );
+ void EXIReadFontFile(u8* Data, u32 Length);
+ void EXIPrepareTRIGameStart();
+diff --git a/kernel/Patch.c b/kernel/Patch.c
+--- a/kernel/Patch.c
++++ b/kernel/Patch.c
+@@ -2701,6 +2701,7 @@
+ 							/* Insert CB value into patched EXIDMA */
+ 							W16(FOffset + 2, value);
+ 							W16(FOffset + 6, valueB);
++							ExiChanTabAddr = (value << 16) + (u32)(s32)(s16)valueB;   /* the guest's EXI channel table the patched EXIDMA stores the TC callback into (callback at +4, channel stride ChanLen) */
+ 							dbgprintf("Patch:[EXIDMA] ChanLen:%08X\r\n", ChanLen);
+ 							W16(FOffset + 0x12, ChanLen);
+ 						} break;
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -337,6 +337,7 @@
+ /* ARM duty cycle and its knobs (/vbba.cfg, see vg_read_cfg) */
+ static u32 vgAutoWrite, vgCfgState, vgCfgDuty, vgAutoInfo, vgBaked = 0xFFFFFFFFu;                /* what VBBAConfigLoad found (copied into the status block when the vBBA starts) */
+ static u32 vgSpinTicks = VBBA_SPIN_TICKS, vgIdleUs = VBBA_IDLE_US, vgPrio = VBBA_THREAD_PRIO, vgAdaptive = 0, vgMainUs = VBBA_MAIN_US;
++static u32 vgCfgAuto = 4u, vgApAt, vgApRun, vgApTotal;   /* /vbba.cfg autopoke=SECONDS (default 4, 0 = off): the guest has been silent that long and its newest EXI command was a channel 0 DMA: its transfer-complete interrupt may have been lost; throw it again (at most 8 per silence, one per period) */
+ static u32 vgCfgPoke, vgPokeAt, vgPokes;      /* experiment switch /vbba.cfg irqpoke=SECONDS (0 = off, default): when the guest has posted no EXI command for N s, throw one spurious EXI transfer-complete interrupt (every 5 s at most): tests the lost-interrupt theory */
+ static u32 vgCfgNetDelayS, vgCfgNoBba, vgCfgNetEarly;   /* netearly=SECONDS (1..30) is netdelay with another log text: the net start is released N s after the vBBA started whatever the SD is doing (no SD-idle wait) */
+ /* test switches from /vbba.cfg: netdelay=SECONDS (net start not before N s after the vBBA started), nobba=1 (the vBBA is never started); both 0 = the behaviour */
+@@ -1373,6 +1374,7 @@
+ 		else if (!strncmp(tok, "nosave=", 7)) { u32 v = vg_num(tok + 7, 10, &ok); if (ok) vbbaCfgNoSave = v ? 1u : 0u; }
+ 		else if (!strncmp(tok, "sdprobe=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok) vbbaCfgSdProbe = v ? 1u : 0u; }
+ 		else if (!strncmp(tok, "irqpoke=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok && v >= 3u && v <= 600u) vgCfgPoke = v; else if (ok && v == 0u) vgCfgPoke = 0; else ok = false; }
++		else if (!strncmp(tok, "autopoke=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && (v == 0u || (v >= 1u && v <= 60u))) vgCfgAuto = v; else ok = false; }
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+ 		while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' && buf[i] != ',') i++;
+@@ -1406,6 +1408,7 @@
+ {
+ 	dbgprintf("VBBA: cfg: %s %u s, nobba %u (0 = off, the behaviour)\r\n", vgCfgNetEarly ? "netearly" : "netdelay", vgCfgNetDelayS, vgCfgNoBba);
+ 	if (vbbaCfgNoSave || vbbaCfgSdProbe) dbgprintf("VBBA: cfg: nosave %u (the memory card is never written to the SD), sdprobe %u (SD sector 0 read once a second, slot LED)\r\n", vbbaCfgNoSave, vbbaCfgSdProbe);
++	dbgprintf("VBBA: cfg: autopoke %u s (0 = off), EXI channel table at %08X\r\n", vgCfgAuto, ExiChanTabAddr);
+ 	if (vgCfgPoke) dbgprintf("VBBA: cfg: irqpoke %u s (experiment: a spurious EXI TC interrupt after that long a guest silence)\r\n", vgCfgPoke);
+ 	if (VBBA_STEP < 2) return;
+ 	dbgprintf("VBBA: duty %u (baked %d%s, /vbba.cfg %s), spin %u ticks, idle %u us%s, priority %02X, main-loop sleep %u us\r\n", vgCfgDuty, vgBaked <= 5u ? (int)vgBaked : -1,
+@@ -1824,6 +1827,7 @@
+ 	sync_before_read((void *)VG_PM(0x800000C0u), 0x40);
+ 	cur_ctx = VG_PM(0x800000D4u)[0]; head = VG_PM(0x800000DCu)[0]; curthr = VG_PM(0x800000E4u)[0];
+ 	dbgprintf("DIAG: os cur ctx %08X cur thread %08X active list head %08X tail %08X | exi cause words %08X %08X %08X\r\n", cur_ctx, curthr, head, VG_PM(0x800000E0u)[0], vg_pm_rd(0x80000010u), vg_pm_rd(0x80000014u), vg_pm_rd(0x80000018u));
++	dbgprintf("DIAG: exi guest: tab %08X cb0 %08X cb1 %08X | os mask %08X | cause words %08X %08X %08X %08X | INT block %08X | autopokes %u\r\n", ExiChanTabAddr, ExiChanTabAddr ? vg_pm_rd(ExiChanTabAddr + 4u) : 0u, ExiChanTabAddr ? vg_pm_rd(ExiChanTabAddr + 4u + 0x38u) : 0u, vg_pm_rd(0x800000C4u), vg_pm_rd(0x80000010u), vg_pm_rd(0x80000014u), vg_pm_rd(0x80000018u), vg_pm_rd(0x8000001Cu), read32(EXI_INT), vgApTotal);
+ 	for (t = head, n = 0; vg_pm_ok(t) && n < 8u; n++) {
+ 		u32 st, pr, q, r1, lr, pc, msr;
+ 		sync_before_read((void *)((u32)VG_PM(t + 0x2C8u) & ~31u), 0x40);
+@@ -2057,6 +2061,12 @@
+ 			if (idle > 9490000u || sdb > 5694000u) {
+ 				if (!printed || (u32)(t - last_print) > 18980000u) { printed = true; last_print = t; vg_diag_dump(idle / 1898000u, sdb / 1898u); }
+ 			} else printed = false;                 /* the guest talks again: arm the next stall report */
++			if (idle < 1898000u) vgApRun = 0;
++			if (vgCfgAuto && idle > vgCfgAuto * 1898000u && vgApRun < 8u && !EXI_IRQ && EXIDiagLastIsCh0Dma() && (u32)(t - vgApAt) > vgCfgAuto * 1898000u) {
++				u32 cb = ExiChanTabAddr ? vg_pm_rd(ExiChanTabAddr + 4u) : 0u;
++				vgApAt = t | 1u; vgApRun++; vgApTotal++; EXIPoke(8u);
++				dbgprintf("VBBA: autopoke #%u (run %u): guest silent %u s after a channel 0 DMA, TC interrupt thrown again at %u ms (tc callback word %08X)\r\n", vgApTotal, vgApRun, idle / 1898000u, vg_now_ms(NULL), cb);
++			}
+ 			if (vgCfgPoke && idle > vgCfgPoke * 1898000u && (u32)(t - vgPokeAt) > 9490000u) { vgPokeAt = t | 1u; vgPokes++; EXIPoke(8u); dbgprintf("VBBA: irqpoke #%u: guest silent %u s, spurious EXI TC interrupt thrown at %u ms\r\n", vgPokes, idle / 1898000u, vg_now_ms(NULL)); }
+ 		}
+ 	}

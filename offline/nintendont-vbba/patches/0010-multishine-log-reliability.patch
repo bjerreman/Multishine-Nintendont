@@ -1,0 +1,146 @@
+# Multishine patch 0010-multishine-log-reliability.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/vsprintf.c (Linus Torvalds, GPL-2.0) keeps its notice; our changes in them are GPL-2.0-only like the rest.
+# New files created by this patch (kernel/vbba_build_id.h) are Multishine's own code written against Nintendont's kernel/loader
+# internals; they are GPL-2.0-only (the licence the larger ones state in their notice; the small headers carry this patch's licence).
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/common.c b/kernel/common.c
+--- a/kernel/common.c
++++ b/kernel/common.c
+@@ -170,6 +170,8 @@
+ #endif
+ 
+ #endif
++	dbgprintf("LOGEND: shutdown request handled, log closed\r\n");   /* the vBBA stopped block (EXIShutdown above) and this line are synced by dbgprintf; the close finishes the file */
++	closeLog();
+ 	/* Allow all IOS IRQs again */
+ 	write32(HW_IPC_ARMCTRL, 0x36);
+ 	/* Send STM Shutdown Ioctl (works on Wii, vWii and Wii VC) */
+diff --git a/kernel/main.c b/kernel/main.c
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -223,6 +223,7 @@
+ 
+ 	if (ConfigGetConfig(NIN_CFG_LOG))
+ 		SDisInit = 1;  // Looks okay after threading fix
++	dbgprintf("RUNID: game %s config %08X memcard blocks %u\r\n", ConfigGetGamePath(), ncfg->Config, (u32)ncfg->MemCardBlocks);   /* */
+ 	dbgprintf("Game path: %s\r\n", ConfigGetGamePath());
+ 	VBBAConfigLog(); /* Multishine vBBA: the duty preset in force (and the auto sweep position) at the start of the run block */
+ 
+diff --git a/kernel/vbba_build_id.h b/kernel/vbba_build_id.h
+new file mode 100644
+--- /dev/null
++++ b/kernel/vbba_build_id.h
+@@ -0,0 +1,5 @@
++/* the loader tag id of this build; build_wii.sh overwrites it after it has computed the id */
++#ifndef VBBA_BUILD_ID_H
++#define VBBA_BUILD_ID_H
++#define VBBA_BUILD_ID "unknown"
++#endif
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -1761,8 +1761,11 @@
+ 		dbgprintf("DIAG: guest tx frame #%u at %u ms: eth %04X proto %u dst %u.%u.%u.%u port %u src port %u arp op %u len %u\r\n", printed, vg_now_ms(NULL), h->eth, h->proto, d >> 24, (d >> 16) & 255u, (d >> 8) & 255u, d & 255u, h->dport, h->sport, h->op, h->len);
+ 	}
+ }
++extern u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* kernel/vsprintf.c */
+ static void vg_diag_10s(u32 t)
+ {
++	static u32 logok;
++	dbgprintf("LOGOK %u errs %u open_err %u bytes %u\r\n", ++logok, dbgLogErrs, dbgLogOpenErr, dbgLogBytes);   /* a run that ends abruptly has its last LOGOK; a stale file has none */
+ 	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
+ 	u32 c, d, ms = pt ? (t - pt) / 1898u : 0, s3 = vg_dg_find_s3(), hook = 0, vi, sf, bba = 0, bbad, ev[VGR_N], evd;
+ 	sync_before_read((void *)VG_PM(0x804D7420u), 0x20);
+diff --git a/kernel/vsprintf.c b/kernel/vsprintf.c
+--- a/kernel/vsprintf.c
++++ b/kernel/vsprintf.c
+@@ -12,9 +12,17 @@
+ #include "vsprintf.h"
+ #include "Config.h"
+ #include "ff_utf8.h"
++#include "vbba_build_id.h"   /* VBBA_BUILD_ID, the loader tag id of this build (written by build_wii.sh) */
++#ifdef NIN_SPECIAL_VERSION
++#define NIN_SPECIAL_VERSION_TXT NIN_SPECIAL_VERSION
++#else
++#define NIN_SPECIAL_VERSION_TXT ""
++#endif
+ 
+ static FIL dbgfile;
+ static int file_opened = -1;
++u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* write errors, bytes written, last open error + 1 (0 = none); read by the vBBA glue for the LOGOK lines */
++static int dbgFirstOpen = 1;                   /* the first open of a run truncates the file (FA_CREATE_ALWAYS), later re-opens append */
+ vu32 SDisInit=0;
+ 
+ extern int svc_write(char *buffer);
+@@ -316,11 +324,13 @@
+ 	{
+ 		if(file_opened != FR_OK)	//if log not open yet
+ 		{
+-			file_opened = f_open_char(&dbgfile, "/ndebug.log", FA_OPEN_ALWAYS|FA_WRITE);
++			file_opened = f_open_char(&dbgfile, "/ndebug.log", (dbgFirstOpen ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)|FA_WRITE);
++			if (file_opened == FR_OK) dbgFirstOpen = 0; else dbgLogOpenErr = (u32)file_opened + 1u;
+ 
+ 			if (file_opened == FR_OK)	//new log opened write header
+ 			{
+ 				u32 v = read32(0x3140);
++				dbgprintf("RUNID: loader tag %s%s ticks %u\r\n", VBBA_BUILD_ID, NIN_SPECIAL_VERSION_TXT, read32(0x0d800010));   /* the first line of every run */
+ 				dbgprintf("Nintendont IOS%d v%d.%d\r\n", v >> 16, (v >> 8) & 0xff, v & 0xff);
+ 
+ 				dbgprintf("Built   : %s %s\r\n", __DATE__, __TIME__ );
+@@ -330,8 +340,8 @@
+ 			
+ 		if (file_opened == FR_OK) {
+ 			f_lseek(&dbgfile, dbgfile.obj.objsize);
+-			f_write(&dbgfile, buffer, strlen(buffer), &read);
+-			f_sync(&dbgfile);
++			if (f_write(&dbgfile, buffer, strlen(buffer), &read) != FR_OK || read != strlen(buffer)) dbgLogErrs++; else dbgLogBytes += read;
++			if (f_sync(&dbgfile) != FR_OK) dbgLogErrs++;
+ 		}
+ 	}
+ 
+diff --git a/loader/source/main.c b/loader/source/main.c
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -974,6 +974,37 @@
+ 		FlushDevices();
+ 	}
+ 
++	{   /* log reliability.  (1) the previous run's /ndebug.log becomes /ndebug.prev.log, so the kernel starts a fresh file (and a missing ndebug.log after a run can only mean it was not written).
++	       (2) a write probe on the game device: when it fails (write-protect switch, read-only card, errors) say so on screen before the game starts. */
++		char lp[40], lq[40], pp[40];
++		WCHAR wa[40], wb[40];
++		FIL pf;
++		UINT pw = 0;
++		int ok = 0, i;
++		snprintf(lp, sizeof(lp), "%s:/ndebug.log", GetRootDevice());
++		snprintf(lq, sizeof(lq), "%s:/ndebug.prev.log", GetRootDevice());
++		snprintf(pp, sizeof(pp), "%s:/multishine/.wprobe", GetRootDevice());
++		for (i = 0; i < 40; i++) { wa[i] = (WCHAR)(unsigned char)lp[i]; wb[i] = (WCHAR)(unsigned char)lq[i]; if (!lp[i]) break; }
++		f_unlink(wb);
++		f_rename(wa, wb);
++		if (f_open_char(&pf, pp, FA_WRITE|FA_CREATE_ALWAYS) == FR_OK) {
++			if (f_write(&pf, "multishine write probe\r\n", 24, &pw) == FR_OK && pw == 24 && f_sync(&pf) == FR_OK) ok = 1;
++			f_close(&pf);
++		}
++		FlushDevices();
++		if (!ok) {
++			static const char msg[] = "SD is write-protected: log and memory card will not be saved";
++			ClearScreen();
++			PrintInfo();
++			PrintFormat(DEFAULT_SIZE, MAROON, (640 - (int)(sizeof(msg) - 1) * 10) / 2, 232, "%s", msg);
++			PrintFormat(DEFAULT_SIZE, MAROON, 40, 262, "(check the lock switch of the SD card; continuing in 6 seconds)");
++			UpdateScreen();
++			VIDEO_WaitVSync();
++			gprintf("%s\r\n", msg);
++			usleep(6000000);
++		}
++	}
++
+ 	// Get multi-game and region code information.
+ 	u32 ISOShift = 0;	// NOTE: This is a 34-bit shifted offset.
+ 	u32 BI2region = 0;	// bi2.bin region code [TODO: Validate?]

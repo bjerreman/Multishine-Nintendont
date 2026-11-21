@@ -1,0 +1,81 @@
+# Multishine patch 0029-multishine-boot-timing.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -56,6 +56,8 @@
+ extern DISC_INTERFACE *driver[_VOLUMES];
+ 
+ extern void __exception_setreload(int t);
++extern void ms_ota_logf(const char *fmt, ...);   /* Multishine boot timing: one 'T boot <step> <ms>' line per step in SD:/multishine/ota.log (the Send diagnostics log) */
++#define MS_SINCE(t0) ((unsigned long)ticks_to_millisecs(gettime() - (t0)))
+ extern void __SYS_ReadROM(void *buf,u32 len,u32 offset);
+ extern u32 __SYS_GetRTC(u32 *gctime);
+ 
+@@ -560,6 +562,8 @@
+ {
+ 	// Exit after 10 seconds if there is an error
+ 	__exception_setreload(10);
++	u64 ms_bt0 = gettime();   /* Multishine boot timing: loader start */
++	ms_ota_logf("T boot start 0");
+ //	u64 timeout = 0;
+ 	CheckForGecko();
+ 	DCInvalidateRange(loader_stub, 0x1800);
+@@ -693,7 +697,10 @@
+ 	       anything wrong = the embedded one below.  The SD card is mounted and unmounted again inside: the stock mount comes later, after the kernel started. */
+ 		void *ota_zip = NULL;
+ 		unsigned int ota_len = 0;
++		u64 ms_bs0 = gettime();
+ 		ms_ota_select(&ota_zip, &ota_len);
++		ms_ota_logf("T boot ota_select_ms %lu", MS_SINCE(ms_bs0));
++		ms_ota_logf("T boot after_ota_select %lu", MS_SINCE(ms_bt0));
+ 		if (ota_zip) { unzip_data(ota_zip, ota_len, &kernel_bin, &kernel_bin_size); free(ota_zip); }
+ 	}
+ 	if (kernel_bin == NULL)
+@@ -724,6 +731,7 @@
+ 	DCFlushRange((void*)0x92FFFFC0,0x20);
+ 	fd = IOS_Open( dev_es, 0 );
+ 	IOS_IoctlvAsync(fd, 0x1F, 0, 0, IOCTL_Buf, NULL, NULL);
++	u64 ms_bw0 = gettime();   // Multishine boot timing
+ 	//Waiting for Nintendont...
+ 	if(argsboot == false)
+ 		ShowMessageScreen("Waiting for Nintendont...");
+@@ -740,6 +748,8 @@
+ 	IOS_Close(fd);
+ 
+ 	gprintf("Nintendont at your service!\r\n%s\r\n", NIN_BUILD_STRING);
++	ms_ota_logf("T boot kernel_wait_ms %lu", MS_SINCE(ms_bw0));
++	ms_ota_logf("T boot kernel_signal %lu", MS_SINCE(ms_bt0));
+ 	KernelLoaded = 1;
+ 
+ 	// Checking for storage devices...
+@@ -757,7 +767,9 @@
+ 		if(i == DEV_USB && isWiiVC)
+ 			break;
+ 		//check SD and USB on Wii and WiiU
++		u64 ms_bm0 = gettime();   // Multishine boot timing
+ 		const WCHAR *devNameFF = MountDevice(i);
++		ms_ota_logf("T boot mount_%s_ms %lu %s", i == DEV_SD ? "sd" : "usb", MS_SINCE(ms_bm0), devNameFF ? "ok" : "fail");
+ 		if (devNameFF && !foundOneDevice)
+ 		{
+ 			// Set this device as primary.
+@@ -851,6 +863,7 @@
+ 	else
+ 		ncfg->VideoMode &= ~NIN_VID_PROG;
+ 
++	ms_ota_logf("T boot menu_start %lu", MS_SINCE(ms_bt0));
+ 	bool SaveSettings = false;
+ 	if(!(ncfg->Config & NIN_CFG_AUTO_BOOT))
+ 	{
+@@ -868,6 +881,7 @@
+ 		//ClearScreen();
+ 	}
+ 
++	ms_ota_logf("T boot after_menu_or_autoboot %lu", MS_SINCE(ms_bt0));
+ //Init DI and set correct ID if needed
+ 	unsigned int CurDICMD = 0;
+ 	if( memcmp(ncfg->GamePath, "di", 3) == 0 )

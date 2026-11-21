@@ -1,0 +1,133 @@
+# Multishine patch 0011-multishine-log-probe-fix.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/vsprintf.c (Linus Torvalds, GPL-2.0) keeps its notice; loader/source/diskio.c keeps its FatFs (ChaN) notice; our changes in them are GPL-2.0-only like the rest.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vsprintf.c b/kernel/vsprintf.c
+--- a/kernel/vsprintf.c
++++ b/kernel/vsprintf.c
+@@ -22,6 +22,7 @@
+ static FIL dbgfile;
+ static int file_opened = -1;
+ u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* write errors, bytes written, last open error + 1 (0 = none); read by the vBBA glue for the LOGOK lines */
++static u32 dbgTrunc;
+ static int dbgFirstOpen = 1;                   /* the first open of a run truncates the file (FA_CREATE_ALWAYS), later re-opens append */
+ vu32 SDisInit=0;
+ 
+@@ -324,12 +325,17 @@
+ 	{
+ 		if(file_opened != FR_OK)	//if log not open yet
+ 		{
+-			file_opened = f_open_char(&dbgfile, "/ndebug.log", (dbgFirstOpen ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)|FA_WRITE);
++			sync_before_read((void*)0x12FFFFC0, 0x40);
++			dbgTrunc = (read32(0x12FFFFD4) == 0x4C475052u && read32(0x12FFFFDC) == 1u) ? 1u : 0u;   /* the loader moved the previous log (or there was none) */
++			file_opened = f_open_char(&dbgfile, "/ndebug.log", ((dbgFirstOpen && dbgTrunc) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)|FA_WRITE);
+ 			if (file_opened == FR_OK) dbgFirstOpen = 0; else dbgLogOpenErr = (u32)file_opened + 1u;
+ 
+ 			if (file_opened == FR_OK)	//new log opened write header
+ 			{
+ 				u32 v = read32(0x3140);
++				dbgprintf("RUNID: log %s, sd probe open %d write %d close %d flush %d | previous log stat %d unlink %d rename %d existed %d\r\n", dbgTrunc ? "truncated" : "appended",
++					(int)(read32(0x12FFFFD8) & 0xFF), (int)((read32(0x12FFFFD8) >> 8) & 0xFF), (int)((read32(0x12FFFFD8) >> 16) & 0xFF), (int)(read32(0x12FFFFD8) >> 24),
++					(int)(read32(0x12FFFFE0) & 0xFF), (int)((read32(0x12FFFFE0) >> 8) & 0xFF), (int)((read32(0x12FFFFE0) >> 16) & 0xFF), (int)(read32(0x12FFFFE0) >> 31));
+ 				dbgprintf("RUNID: loader tag %s%s ticks %u\r\n", VBBA_BUILD_ID, NIN_SPECIAL_VERSION_TXT, read32(0x0d800010));   /* the first line of every run */
+ 				dbgprintf("Nintendont IOS%d v%d.%d\r\n", v >> 16, (v >> 8) & 0xff, v & 0xff);
+ 
+diff --git a/loader/source/diskio.c b/loader/source/diskio.c
+--- a/loader/source/diskio.c
++++ b/loader/source/diskio.c
+@@ -269,7 +269,7 @@
+ 
+ 	if (cache[pdrv]) {
+ 		// Flush the cache.
+-		_FAT_cache_flush(cache[pdrv]);
++		if (!_FAT_cache_flush(cache[pdrv])) return RES_ERROR;   /* a failed write-back is reported (the probe in main.c uses it) */
+ 	}
+ 
+ 	return RES_OK;
+diff --git a/loader/source/main.c b/loader/source/main.c
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -974,33 +974,61 @@
+ 		FlushDevices();
+ 	}
+ 
+-	{   /* log reliability.  (1) the previous run's /ndebug.log becomes /ndebug.prev.log, so the kernel starts a fresh file (and a missing ndebug.log after a run can only mean it was not written).
+-	       (2) a write probe on the game device: when it fails (write-protect switch, read-only card, errors) say so on screen before the game starts. */
+-		char lp[40], lq[40], pp[40];
+-		WCHAR wa[40], wb[40];
++	{   /* /23: log reliability.  (1) the previous run's /ndebug.log is moved to /ndebug.old (never deleted: only an OLDER ndebug.old is replaced, and only when the move can happen), so the kernel starts a fresh file.
++	       (2) a write probe on the game device; the loader's disk_ioctl has no CTRL_SYNC (treated f_sync's FR_DISK_ERR as a failed probe: that was the bug), so the probe checks open, write, the byte count and the cache write-back.
++	       Everything is handed to the kernel at 0x92FFFFD4 (magic 'LGPR'), 0x92FFFFD8 (probe FRESULT | write FRESULT << 8 | close FRESULT << 16 | flush result << 24), 0x92FFFFDC (1 = the kernel may truncate ndebug.log:
++	       it did not exist or was moved; 0 = it still holds the previous run, the kernel appends) and 0x92FFFFE0 (stat | unlink << 8 | rename << 16 | 0x80000000 if ndebug.log existed). */
++		char lp[40], lq[40], pp[48];
++		WCHAR wa[48], wb[48];
+ 		FIL pf;
++		FILINFO fi;
+ 		UINT pw = 0;
+-		int ok = 0, i;
++		FRESULT fo = FR_OK, fw = FR_OK, fc = FR_OK, fs = FR_OK, fu = FR_OK, fr = FR_OK;
++		int fl = 0, k, existed = 0, truncate_ok = 1;
++		const BYTE drv = (strcmp(GetRootDevice(), "sd") == 0) ? DEV_SD : DEV_USB;
+ 		snprintf(lp, sizeof(lp), "%s:/ndebug.log", GetRootDevice());
+-		snprintf(lq, sizeof(lq), "%s:/ndebug.prev.log", GetRootDevice());
+-		snprintf(pp, sizeof(pp), "%s:/multishine/.wprobe", GetRootDevice());
+-		for (i = 0; i < 40; i++) { wa[i] = (WCHAR)(unsigned char)lp[i]; wb[i] = (WCHAR)(unsigned char)lq[i]; if (!lp[i]) break; }
+-		f_unlink(wb);
+-		f_rename(wa, wb);
+-		if (f_open_char(&pf, pp, FA_WRITE|FA_CREATE_ALWAYS) == FR_OK) {
+-			if (f_write(&pf, "multishine write probe\r\n", 24, &pw) == FR_OK && pw == 24 && f_sync(&pf) == FR_OK) ok = 1;
+-			f_close(&pf);
++		snprintf(lq, sizeof(lq), "%s:/ndebug.old", GetRootDevice());
++		snprintf(pp, sizeof(pp), "%s:/multishine/WPROBE.TMP", GetRootDevice());   /* 8.3 name: independent of long file name support */
++		for (k = 0; k < 47 && lp[k]; k++) wa[k] = (WCHAR)(unsigned char)lp[k];
++		wa[k] = 0;
++		for (k = 0; k < 47 && lq[k]; k++) wb[k] = (WCHAR)(unsigned char)lq[k];
++		wb[k] = 0;
++		fs = f_stat(wa, &fi);
++		if (fs == FR_OK) {
++			existed = 1;
++			fu = f_stat(wb, &fi);                       /* an older ndebug.old */
++			if (fu == FR_OK) fu = f_unlink(wb);         /* only that one is replaced; ndebug.log is never deleted */
++			if (fu == FR_OK || fu == FR_NO_FILE) {
++				fr = f_rename(wa, wb);
++				if (fr != FR_OK) truncate_ok = 0;       /* ndebug.log stays as it is: the kernel appends instead of truncating */
++			} else truncate_ok = 0;
+ 		}
++		fo = f_open_char(&pf, pp, FA_WRITE|FA_CREATE_ALWAYS);
++		if (fo == FR_OK) {
++			fw = f_write(&pf, "multishine write probe\r\n", 24, &pw);
++			if (fw == FR_OK && pw != 24) fw = (FRESULT)100;
++			fc = f_close(&pf);                          /* FR_DISK_ERR is expected here: f_sync -> sync_fs -> disk_ioctl(CTRL_SYNC) is not implemented in this loader; the file data and directory entry are written */
++		}
++		fl = (int)disk_flush(drv);
+ 		FlushDevices();
+-		if (!ok) {
+-			static const char msg[] = "SD is write-protected: log and memory card will not be saved";
++		*(vu32*)0x92FFFFD4 = 0x4C475052;
++		*(vu32*)0x92FFFFD8 = (u32)fo | ((u32)fw << 8) | ((u32)fc << 16) | ((u32)fl << 24);
++		*(vu32*)0x92FFFFDC = (u32)truncate_ok;
++		*(vu32*)0x92FFFFE0 = (u32)fs | ((u32)fu << 8) | ((u32)fr << 16) | (existed ? 0x80000000u : 0);
++		DCFlushRange((void*)0x92FFFFC0, 0x40);
++		gprintf("SD probe: open %d write %d close %d flush %d | log stat %d unlink %d rename %d\r\n", (int)fo, (int)fw, (int)fc, fl, (int)fs, (int)fu, (int)fr);
++		if (fo != FR_OK || fw != FR_OK || fl != 0) {
++			char m1[64], m2[64];
++			int code = (fo != FR_OK) ? (int)fo : (fw != FR_OK) ? (int)fw : 200 + fl;
++			snprintf(m1, sizeof(m1), "SD write test failed (code %d)", code);
++			snprintf(m2, sizeof(m2), "open %d write %d close %d flush %d", (int)fo, (int)fw, (int)fc, fl);
+ 			ClearScreen();
+ 			PrintInfo();
+-			PrintFormat(DEFAULT_SIZE, MAROON, (640 - (int)(sizeof(msg) - 1) * 10) / 2, 232, "%s", msg);
+-			PrintFormat(DEFAULT_SIZE, MAROON, 40, 262, "(check the lock switch of the SD card; continuing in 6 seconds)");
++			PrintFormat(DEFAULT_SIZE, MAROON, (640 - (int)strlen(m1) * 10) / 2, 232, "%s", m1);
++			PrintFormat(DEFAULT_SIZE, MAROON, (640 - (int)strlen(m2) * 10) / 2, 262, "%s", m2);
++			PrintFormat(DEFAULT_SIZE, MAROON, 40, 292, "Log and memory card may not be saved. Continuing in 6 s.");
+ 			UpdateScreen();
+ 			VIDEO_WaitVSync();
+-			gprintf("%s\r\n", msg);
+ 			usleep(6000000);
+ 		}
+ 	}

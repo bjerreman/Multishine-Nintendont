@@ -1,0 +1,24 @@
+# build output and local state (never committed)
+build/
+out/
+dist/
+__pycache__/
+*.pyc
+# macOS Finder / Spotlight / editor litter
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+Icon\r
+*.swp
+# keys, local profiles and personal files: never in this repository
+*.key
+*.pem
+*.seed
+*.local.json
+private/
+user.json

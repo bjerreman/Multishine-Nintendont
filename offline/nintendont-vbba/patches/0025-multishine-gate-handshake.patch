@@ -1,0 +1,44 @@
+# Multishine patch 0025-multishine-gate-handshake.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index 7d84633..e35eec7 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -338,7 +338,8 @@ static volatile u32 vgNoStart = (VBBA_OFF) & 64;
+ static u32 vgAutoWrite, vgCfgState, vgCfgDuty, vgAutoInfo, vgBaked = 0xFFFFFFFFu;                /* what VBBAConfigLoad found (copied into the status block when the vBBA starts) */
+ static u32 vgSpinTicks = VBBA_SPIN_TICKS, vgIdleUs = VBBA_IDLE_US, vgPrio = VBBA_THREAD_PRIO, vgAdaptive = 0, vgMainUs = VBBA_MAIN_US;
+ static u32 vgCfgAuto = 0u, vgApAt, vgApRun, vgApTotal;   /* /vbba.cfg autopoke=SECONDS (default 4, 0 = off): the guest has been silent that long and its newest EXI command was a channel 0 DMA: its transfer-complete interrupt may have been lost; throw it again (at most 8 per silence, one per period) */
+-static u32 vgCfgGate = 1u, vgRegLastTick;   /* /vbba.cfg gate=0|1 (default 1): the default-timing net start (SD idle for 3 s) also waits until the guest has finished its BBA init handshake (challenge response and rx enable seen) and that was 3 s ago; the cap still applies */
++static u32 vgCfgGate = 1u, vgRegLastTick, vgHsTick, vgHsLogged;   /* vgHsTick = HW_TIMER when the guest's challenge response AND rx enable were both seen; the gate releases 3 s after it (SD activity and register polling do not count) */
++/* /vbba.cfg gate=0|1 (default 1): the default-timing net start (SD idle for 3 s) also waits until the guest has finished its BBA init handshake (challenge response and rx enable seen) and that was 3 s ago; the cap still applies */
+ static u32 vgCfgPoke, vgPokeAt, vgPokes;      /* experiment switch /vbba.cfg irqpoke=SECONDS (0 = off, default): when the guest has posted no EXI command for N s, throw one spurious EXI transfer-complete interrupt (every 5 s at most): tests the lost-interrupt theory */
+ static u32 vgCfgNetDelayS, vgCfgNoBba, vgCfgNetEarly;   /* netearly=SECONDS (1..30) is netdelay with another log text: the net start is released N s after the vBBA started whatever the SD is doing (no SD-idle wait) */
+ /* test switches from /vbba.cfg: netdelay=SECONDS (net start not before N s after the vBBA started), nobba=1 (the vBBA is never started); both 0 = the behaviour */
+@@ -991,6 +992,7 @@ static void vg_reg_ev(u32 kind, u32 val)
+ {
+ 	vgRegCnt[kind]++;
+ 	vgRegLastTick = read32(HW_TIMER) | 1u;
++	if (!vgHsTick && vgRegCnt[VGR_RESPONSE] && vgRegCnt[VGR_SR_ON]) vgHsTick = read32(HW_TIMER) | 1u;   /* */
+ 	if (vgRegHead - vgRegTail >= 32u) { vgRegLost++; return; }
+ 	vgRegRing[vgRegHead & 31u].tick = read32(HW_TIMER); vgRegRing[vgRegHead & 31u].kind = (u16)kind; vgRegRing[vgRegHead & 31u].val = (u16)val;
+ 	vgRegHead++;
+@@ -2125,8 +2127,12 @@ void VBBAUpdate(void)
+ 		if (!ops_init || ops != last_ops) { ops_init = true; last_ops = ops; last_chg = ms; }
+ 		if (vgCfgNetDelayS) { if (ms >= vgCfgNetDelayS * 1000u) { vgNetReleased = true; if (vgCfgNetEarly) dbgprintf("VBBA: net start released EARLY at %u ms (netearly %u s, SD ops %u)\r\n", ms, vgCfgNetDelayS, ops); else dbgprintf("VBBA: net start released at %u ms (netdelay %u s)\r\n", ms, vgCfgNetDelayS); } }
+ 		else if (VBBA_NET_DELAY_S) { if (ms >= (u32)VBBA_NET_DELAY_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released at %u ms\r\n", ms); } }
+-		else if (ms >= (u32)VBBA_NET_CAP_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: cap reached at %u ms (SD ops %u)\r\n", ms, ops); }
+-		else if (ms >= (u32)VBBA_NET_MIN_S * 1000u && (u32)(ms - last_chg) >= (u32)VBBA_NET_IDLE_S * 1000u && (!vgCfgGate || (vgRegCnt[VGR_RESPONSE] && vgRegCnt[VGR_SR_ON] && vgRegLastTick && (u32)(read32(HW_TIMER) - vgRegLastTick) >= 3u * 1898000u))) { vgNetReleased = true; dbgprintf("VBBA: net start released: SD idle for %u s at %u ms (SD ops %u)%s\r\n", (u32)VBBA_NET_IDLE_S, ms, ops, vgCfgGate ? ", guest BBA init done (gate)" : ""); }
++		else if (ms >= (u32)VBBA_NET_CAP_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: cap reached at %u ms (SD ops %u)%s\r\n", ms, ops, vgCfgGate ? " (gate: no handshake, cap)" : ""); }
++		else if (vgCfgGate) {   /* the earliest safe release = the guest's BBA init handshake done + 3 s (steady BBA polling and SD reads do not matter); the 60 s cap above stays */
++			if (vgHsTick && !vgHsLogged) { vgHsLogged = 1; dbgprintf("VBBA: gate: handshake seen at %u ms (challenge response and rx enable)\r\n", ms - (u32)(read32(HW_TIMER) - vgHsTick) / 1898u); }
++			if (vgHsTick && ms >= (u32)VBBA_NET_MIN_S * 1000u && (u32)(read32(HW_TIMER) - vgHsTick) >= 3u * 1898000u) { vgNetReleased = true; dbgprintf("VBBA: gate: released at %u ms (handshake + 3 s, SD ops %u)\r\n", ms, ops); }
++		}
++		else if (ms >= (u32)VBBA_NET_MIN_S * 1000u && (u32)(ms - last_chg) >= (u32)VBBA_NET_IDLE_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: SD idle for %u s at %u ms (SD ops %u)\r\n", (u32)VBBA_NET_IDLE_S, ms, ops); }
+ 	}
+ 	MS_ST(MSS_VREOPEN);
+ 	vg_reopen();                                        /* missing handles / ncd: blocking opens belong here, not on the fast thread */

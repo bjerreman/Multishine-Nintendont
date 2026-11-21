@@ -1,0 +1,31 @@
+# Multishine patch 0012-multishine-chip-mac-follows-interface.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c	2026-10-31 15:03:57
++++ b/kernel/vbba_glue.c	2026-10-31 15:11:37
+@@ -287,7 +287,7 @@
+ #define VG_CRUMB(...) do {} while (0)
+ #endif
+ #ifndef VBBA_IFMAC_ON
+-#define VBBA_IFMAC_ON 0     /* ip/top interface-MAC query (log only): off in the shipped build until a Wii run shows it does not disturb UDP (the lanmac test broke UDP with it plus a chip swap) */
++#define VBBA_IFMAC_ON 1     /* ip/top interface-MAC query (getinterfaceopt 0x1004) once the address is up; the chip MAC follows it through vbba_chip_set_mac, which no longer touches the PAR registers a running guest has read (the lanmac test's UDP loss: the filter changed under a guest still sending with the old source MAC) */
+ #endif
+ static struct vg_status *vst;
+ static void vg_publish(void)       /* the working copy lives in our heap area; only words 0..127 go to the published block */
+@@ -851,7 +851,10 @@
+ 				r->result = 0;
+ 				if (mres >= 0 && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5])) {
+ 					dbgprintf("VBBA: mac (ip/top) %02X:%02X:%02X:%02X:%02X:%02X\r\n", m[0], m[1], m[2], m[3], m[4], m[5]);
+-					/* log only: swapping the chip MAC after the address is up broke UDP on the Wii (lanmac test); the chip keeps the early ncd MAC */
++					if (V && memcmp(m, V->chip.mac, 6) != 0) {
++						vbba_chip_set_mac(&V->chip, m);     /* before the guest's first reset the guest reads it; after, the next adapter init (Reconnect) does */
++						dbgprintf("VBBA: chip MAC now %02X:%02X:%02X:%02X:%02X:%02X (guest has%s read the old one)\r\n", m[0], m[1], m[2], m[3], m[4], m[5], V->chip.guest_reset ? "" : " not");
++					} else dbgprintf("VBBA: chip MAC already the active interface's\r\n");
+ 				} else dbgprintf("VBBA: mac (ip/top) read failed (rc %d); chip keeps the ncd MAC\r\n", mres);
+ 			}
+ 		} else if (r->op == VBBA_IOS_POLL) {

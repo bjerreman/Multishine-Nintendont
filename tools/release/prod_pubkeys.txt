@@ -1,0 +1,4 @@
+# PUBLIC keys only. Production OTA signing keys. One 64-hex key per line: "NAME HEX".
+# Read by the loader build (the stub and the shell pin these keys, A then B) and by the publish tool, which stays outside this repository.
+prod-a df02c9cfb47c9e0958765c5fac76f92bc50fbbf80ec4476821514441cab74dcc
+prod-b 7d101a5cadaf2f86e952286861e37adca8622a598d8c23974fa4294abfa28a7a

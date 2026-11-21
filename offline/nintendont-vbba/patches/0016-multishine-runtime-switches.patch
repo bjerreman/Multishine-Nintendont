@@ -1,0 +1,101 @@
+# Multishine patch 0016-multishine-runtime-switches.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/Patch.c b/kernel/Patch.c
+index a1abc28..049a54a 100644
+--- a/kernel/Patch.c
++++ b/kernel/Patch.c
+@@ -51,6 +51,7 @@ static u32 POffset = PATCH_OFFSET_ENTRY;
+ vu32 useipl = 0, useipltri = 0;
+ vu32 DisableSIPatch = 0, DisableEXIPatch = 0, bbaEmuWanted = 0;
+ extern vu32 vbbaWanted;
++extern u32 VBBANoBba(void);
+ extern vu32 TRIGame;
+ extern vu16 SOCurrentTotalFDs;
+ 
+@@ -1709,12 +1710,14 @@ void DoPatches( char *Buffer, u32 Length, u32 DiscOffset )
+ 	/* Multishine virtual BBA: the same "BBA Emulation" switch, for Super Smash Bros. Melee (game ID GALE, any NTSC-U
+ 	   revision) only, which is none of the titles above.  It needs the EXI function patches (memory card emulation
+ 	   on, as by default): without them the game talks to the real Wii EXI hardware and finds no adapter. */
+-	if(ConfigGetConfig(NIN_CFG_BBA_EMU) && bbaEmuWanted == 0 && GAME_ID == 0x47414C45 && TRIGame == TRI_NONE && !DisableEXIPatch)
++	if(ConfigGetConfig(NIN_CFG_BBA_EMU) && bbaEmuWanted == 0 && GAME_ID == 0x47414C45 && TRIGame == TRI_NONE && !DisableEXIPatch && !VBBANoBba())
+ 		vbbaWanted = 1;
+ 	else
+ 		vbbaWanted = 0;
+-	if(ConfigGetConfig(NIN_CFG_BBA_EMU) && GAME_ID == 0x47414C45 && vbbaWanted == 0)
++	if(ConfigGetConfig(NIN_CFG_BBA_EMU) && GAME_ID == 0x47414C45 && vbbaWanted == 0 && !VBBANoBba())
+ 		dbgprintf("Patch:[vBBA] not started: memory card emulation is off (the EXI patches are needed)\r\n");
++	if(ConfigGetConfig(NIN_CFG_BBA_EMU) && GAME_ID == 0x47414C45 && VBBANoBba())
++		dbgprintf("Patch:[vBBA] not started: /vbba.cfg nobba=1 (final29 test)\r\n");
+ 
+ 	if(bbaEmuWanted)
+ 		PatchCount &= ~FPATCH_OSSleepThread;
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index a52f67f..62179bb 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -61,6 +61,7 @@ void VBBAExiDma(u8 *ptr, u32 len, u32 mode) { (void)ptr; (void)len; (void)mode;
+ u32 VBBAMainDelay(u32 us) { return us; }
+ void VBBAConfigLoad(void) {}
+ void VBBAConfigLog(void) {}
++u32 VBBANoBba(void) { return 0; }
+ #else
+ #ifndef VBBA_OFF
+ #define VBBA_OFF 0       /* freeze hunt (b1 diagnostic): bit 1 send/receive counters + latency stamps, 2 duty accounting, 4 kd timing, 8 heartbeat/watchdog extras, 16 publication to 0x131BE000, 32 stack high-water probe (invalidates the live thread stacks!), 64 never start the vBBA, 128 heap + status block in kernel .bss instead of MEM2 0x131xxxxx, 256 b0 transport sources linked (build in a worktree with the old files), 512 b0 sendto timeout (abandon after 3 s) */
+@@ -325,6 +326,7 @@ static volatile u32 vgNoStart = (VBBA_OFF) & 64;
+ /* ARM duty cycle and its knobs (/vbba.cfg, see vg_read_cfg) */
+ static u32 vgAutoWrite, vgCfgState, vgCfgDuty, vgAutoInfo, vgBaked = 0xFFFFFFFFu;                /* what VBBAConfigLoad found (copied into the status block when the vBBA starts) */
+ static u32 vgSpinTicks = VBBA_SPIN_TICKS, vgIdleUs = VBBA_IDLE_US, vgPrio = VBBA_THREAD_PRIO, vgAdaptive = 0, vgMainUs = VBBA_MAIN_US;
++static u32 vgCfgNetDelayS, vgCfgNoBba;   /* test switches from /vbba.cfg: netdelay=SECONDS (net start not before N s after the vBBA started), nobba=1 (the vBBA is never started); both 0 = the behaviour */
+ static u32 dcSleep, dcSleepWant, dcServe, dcBg, dcLoops, dcSpin, dcSleeps, dcT0;
+ static u32 vgSleptAt;
+ /* log ring: filled by the vBBA thread, printed with dbgprintf by the MAIN thread only (VBBAUpdate/VBBAShutdown); the
+@@ -1287,6 +1289,8 @@ void VBBAConfigLoad(void)
+ 		else if (!strncmp(tok, "prio=", 5)) { prio = vg_num(tok + 5, 16, &ok); hv |= ok ? 4u : 0; }
+ 		else if (!strncmp(tok, "main=", 5)) { main_us = vg_num(tok + 5, 10, &ok); hv |= ok ? 8u : 0; }
+ 		else if (!strncmp(tok, "dns=", 4)) { u32 v = vg_ip4(tok + 4, &ok); if (ok) vgDhcpDns = v; }
++		else if (!strncmp(tok, "netdelay=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v <= 600u) vgCfgNetDelayS = v; else ok = false; }
++		else if (!strncmp(tok, "nobba=", 6)) { u32 v = vg_num(tok + 6, 10, &ok); if (ok) vgCfgNoBba = v ? 1u : 0u; }
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+ 		while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' && buf[i] != ',') i++;
+@@ -1313,9 +1317,12 @@ void VBBAConfigLoad(void)
+ 	vgBaked = baked;
+ }
+ 
++u32 VBBANoBba(void) { return vgCfgNoBba; }
++
+ /* the first lines of the run block in /ndebug.log (main.c, right after the "Game path" line; the SD log is on by then): which preset this run uses and why */
+ void VBBAConfigLog(void)
+ {
++	dbgprintf("VBBA: cfg: netdelay %u s, nobba %u (0 = off, the behaviour)\r\n", vgCfgNetDelayS, vgCfgNoBba);
+ 	if (VBBA_STEP < 2) return;
+ 	dbgprintf("VBBA: duty %u (baked %d%s, /vbba.cfg %s), spin %u ticks, idle %u us%s, priority %02X, main-loop sleep %u us\r\n", vgCfgDuty, vgBaked <= 5u ? (int)vgBaked : -1,
+ 		(vgAutoInfo & 0xFF) ? ", auto sweep" : "", (vgCfgState & 1) ? "read" : "not found", vgSpinTicks, vgIdleUs, vgAdaptive ? " adaptive" : "", vgPrio, vgMainUs ? vgMainUs : 20u);
+@@ -1441,9 +1448,10 @@ static void vg_start(void)
+ 	vgStarted = true;
+ 	vst->flags = 1;
+ 	dbgprintf("VBBA: init: setting vbbaActive, releasing the fast thread\r\n");
+-	vgNetReleased = !(VBBA_NET_DELAY_S || VBBA_NET_ACT);
++	vgNetReleased = !(VBBA_NET_DELAY_S || VBBA_NET_ACT || vgCfgNetDelayS);
+ 	vgNetT0 = vg_now_ms(NULL);
+-	if (VBBA_NET_DELAY_S) dbgprintf("VBBA: net start deferred until %u s\r\n", (u32)VBBA_NET_DELAY_S);
++	if (vgCfgNetDelayS) dbgprintf("VBBA: net start deferred until %u s after the vBBA start (/vbba.cfg netdelay)\r\n", vgCfgNetDelayS);
++	else if (VBBA_NET_DELAY_S) dbgprintf("VBBA: net start deferred until %u s\r\n", (u32)VBBA_NET_DELAY_S);
+ 	else if (VBBA_NET_ACT) dbgprintf("VBBA: net start deferred until the SD is idle for %u s (min %u s, cap %u s)\r\n", (u32)VBBA_NET_IDLE_S, (u32)VBBA_NET_MIN_S, (u32)VBBA_NET_CAP_S);
+ 	vbbaActive = 1;
+ 	vgGo = 1;
+@@ -1945,7 +1953,8 @@ void VBBAUpdate(void)
+ 		static u32 last_ops, last_chg; static bool ops_init;
+ 		u32 ms = vg_now_ms(NULL) - vgNetT0, ops = vbbaSdOps;      /* seconds since the vBBA started, not the absolute clock */
+ 		if (!ops_init || ops != last_ops) { ops_init = true; last_ops = ops; last_chg = ms; }
+-		if (VBBA_NET_DELAY_S) { if (ms >= (u32)VBBA_NET_DELAY_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released at %u ms\r\n", ms); } }
++		if (vgCfgNetDelayS) { if (ms >= vgCfgNetDelayS * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released at %u ms (netdelay %u s)\r\n", ms, vgCfgNetDelayS); } }
++		else if (VBBA_NET_DELAY_S) { if (ms >= (u32)VBBA_NET_DELAY_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released at %u ms\r\n", ms); } }
+ 		else if (ms >= (u32)VBBA_NET_CAP_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: cap reached at %u ms (SD ops %u)\r\n", ms, ops); }
+ 		else if (ms >= (u32)VBBA_NET_MIN_S * 1000u && (u32)(ms - last_chg) >= (u32)VBBA_NET_IDLE_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: SD idle for %u s at %u ms (SD ops %u)\r\n", (u32)VBBA_NET_IDLE_S, ms, ops); }
+ 	}

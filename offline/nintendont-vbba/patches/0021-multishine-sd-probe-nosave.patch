@@ -1,0 +1,165 @@
+# Multishine patch 0021-multishine-sd-probe-nosave.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/GCNCard.c b/kernel/GCNCard.c
+--- a/kernel/GCNCard.c
++++ b/kernel/GCNCard.c
+@@ -56,6 +56,7 @@
+ }
+ #endif
+ 
++extern vu32 vbbaCfgNoSave, vbbaNoSaveN, vbbaNoSaveTick;   /* kernel/vbba_glue.c, */
+ void GCNCard_DiagState(u32 *o)      /* Multishine read-only view for the DIAG log lines */
+ {
+ 	const GCNCard_ctx *c = &memCard[0];
+@@ -343,9 +344,17 @@
+ 			//dbgprintf("EXI: Saving memory card in Slot %c...", (slot+'A'));
+ //#endif
+ 			FIL fd;
+-			int ret = f_open_char(&fd, ctx->filename, FA_WRITE|FA_OPEN_EXISTING);
+-			if (ret == FR_OK)
++			int ret = FR_OK;
++			if (vbbaCfgNoSave)
+ 			{
++				/* (/vbba.cfg nosave=1): the card image stays in RAM, the SD is not touched; the save counts as done.  A test switch: the changes of this run are lost at power off. */
++				vbbaNoSaveN++; vbbaNoSaveTick = read32(HW_TIMER);
++			}
++			else
++				ret = f_open_char(&fd, ctx->filename, FA_WRITE|FA_OPEN_EXISTING);
++			if (vbbaCfgNoSave) {}
++			else if (ret == FR_OK)
++			{
+ 				UINT wrote;
+ 				sync_before_read(ctx->base, ctx->size);
+ 
+diff --git a/kernel/main.c b/kernel/main.c
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -339,6 +339,7 @@
+ 	while (1)
+ 	{
+ 		MS_ST(MSS_TOP);
++		VBBASdProbeTick();   /* (/vbba.cfg sdprobe=1) */
+ 		_ahbMemFlush(0);
+ #ifdef PERFMON
+ 		loopCnt++;
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -40,10 +40,14 @@
+ #include "EXI.h"
+ #include "ff_utf8.h"
+ #include "vbba_glue.h"
++#include "SDI.h"   /* sdio_ReadSectors for the sdprobe */
+ #include "vbba_stall.h"   /* stall breadcrumbs, watchdog thread, slot LED */
+ 
+ vu32 vbbaWanted = 0;
+ vu32 vbbaActive = 0;
++vu32 vbbaCfgNoSave, vbbaCfgSdProbe;   /* /vbba.cfg nosave=1 (GCNCard_Save does not touch the SD), sdprobe=1 (1 s read of SD sector 0, timed; slot LED) */
++vu32 vbbaNoSaveN, vbbaNoSaveTick;   /* card saves skipped by nosave=1 and the HW_TIMER of the last one */
++vu32 vbbaPrN, vbbaPrOk, vbbaPrFail, vbbaPrBusy, vbbaPrLast, vbbaPrMax, vbbaPrFailTick, vbbaPrBad;   /* sdprobe counters, the probe in flight (HW_TIMER|1, 0 = none), last/max duration in ticks, first failure, last probe bad (failed or slower than 500 ms) */
+ vu32 vbbaTakeover = 0;      /* 1: the vBBA thread was stalled/cancelled by the watchdog, the main loop serves EXI again (network down) */
+ extern bool EXI_IRQ;
+ extern bool DI_IRQ;          /* kernel/DI.c: true while an asynchronous disc read may be using FatFs (the SD log is written only when it is false) */
+@@ -61,6 +65,7 @@
+ u32 VBBAMainDelay(u32 us) { return us; }
+ void VBBAConfigLoad(void) {}
+ void VBBAConfigLog(void) {}
++void VBBASdProbeTick(void) {}
+ u32 VBBANoBba(void) { return 0; }
+ #else
+ #ifndef VBBA_OFF
+@@ -1180,6 +1185,11 @@
+ 				msCrumb.wd = 0;
+ 			}
+ 		} else { mode = 0; if (msCrumb.curms) { msCrumb.curms = 0; } }
++		if (vbbaCfgSdProbe) {                                /* the SD probe decides the LED: solid = a probe request pending more than 2 s, fast blink = the last probe failed or took over 500 ms, otherwise the normal slow blink */
++			u32 pb = vbbaPrBusy;
++			if (pb && (u32)(now - (pb & ~1u)) > 3796000u) mode = 2u;
++			else if (vbbaPrBad && mode == 0u) mode = 1u;
++		}
+ 		if (mode == 2u) set32(HW_GPIO_OUT, GPIO_SLOT_LED);
+ 		else if (mode == 1u || (beat & 1u) == 0) { led ^= 1u; if (led) set32(HW_GPIO_OUT, GPIO_SLOT_LED); else clear32(HW_GPIO_OUT, GPIO_SLOT_LED); }
+ 	}
+@@ -1360,6 +1370,8 @@
+ 		else if (!strncmp(tok, "netearly=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v >= 1u && v <= 30u) { vgCfgNetDelayS = v; vgCfgNetEarly = 1; } else ok = false; }
+ 		else if (!strncmp(tok, "netdelay=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v <= 600u) vgCfgNetDelayS = v; else ok = false; }
+ 		else if (!strncmp(tok, "nobba=", 6)) { u32 v = vg_num(tok + 6, 10, &ok); if (ok) vgCfgNoBba = v ? 1u : 0u; }
++		else if (!strncmp(tok, "nosave=", 7)) { u32 v = vg_num(tok + 7, 10, &ok); if (ok) vbbaCfgNoSave = v ? 1u : 0u; }
++		else if (!strncmp(tok, "sdprobe=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok) vbbaCfgSdProbe = v ? 1u : 0u; }
+ 		else if (!strncmp(tok, "irqpoke=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok && v >= 3u && v <= 600u) vgCfgPoke = v; else if (ok && v == 0u) vgCfgPoke = 0; else ok = false; }
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+@@ -1393,6 +1405,7 @@
+ void VBBAConfigLog(void)
+ {
+ 	dbgprintf("VBBA: cfg: %s %u s, nobba %u (0 = off, the behaviour)\r\n", vgCfgNetEarly ? "netearly" : "netdelay", vgCfgNetDelayS, vgCfgNoBba);
++	if (vbbaCfgNoSave || vbbaCfgSdProbe) dbgprintf("VBBA: cfg: nosave %u (the memory card is never written to the SD), sdprobe %u (SD sector 0 read once a second, slot LED)\r\n", vbbaCfgNoSave, vbbaCfgSdProbe);
+ 	if (vgCfgPoke) dbgprintf("VBBA: cfg: irqpoke %u s (experiment: a spurious EXI TC interrupt after that long a guest silence)\r\n", vgCfgPoke);
+ 	if (VBBA_STEP < 2) return;
+ 	dbgprintf("VBBA: duty %u (baked %d%s, /vbba.cfg %s), spin %u ticks, idle %u us%s, priority %02X, main-loop sleep %u us\r\n", vgCfgDuty, vgBaked <= 5u ? (int)vgBaked : -1,
+@@ -1915,11 +1928,33 @@
+ extern u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* kernel/vsprintf.c */
+ extern u32 dbgBitN, dbgBitVal, dbgBitTick, dbgBitLast;   /* kernel/vsprintf.c, */
+ extern vu32 vbbaSdErrN, vbbaSdErrRet, vbbaSdErrCmd, vbbaSdErrTick, vbbaSdWrRetry, vbbaSdWrFail;   /* kernel/SDI.c, */
++/* /vbba.cfg sdprobe=1.  Once a second the main loop reads SD sector 0 straight through the SD driver (no FatFs, a 32 byte aligned static buffer, so no shared buffer) and times it.
++   An SD request that never completes keeps the main loop here (stage MSS_PROBE, an SD stage): the watchdog shows it as a solid slot LED; a probe that failed or took over 500 ms makes the LED blink fast.
++   Skipped while an asynchronous disc read may be using the SD (DI_IRQ). */
++static u8 vgProbeBuf[512] __attribute__((aligned(32)));
++void VBBASdProbeTick(void)
++{
++	static u32 next;
++	u32 t = read32(HW_TIMER), t1;
++	bool ok;
++	if (!vbbaCfgSdProbe || DI_IRQ || (u32)(t - next) < 1898000u) return;
++	next = t;
++	MS_ST(MSS_PROBE);
++	vbbaPrBusy = t | 1u;
++	ok = sdio_ReadSectors(0, 1, vgProbeBuf);
++	t1 = read32(HW_TIMER);
++	vbbaPrBusy = 0;
++	vbbaPrN++; vbbaPrLast = t1 - t; if (vbbaPrLast > vbbaPrMax) vbbaPrMax = vbbaPrLast;
++	if (ok) vbbaPrOk++; else if (!vbbaPrFail++) vbbaPrFailTick = t1;
++	vbbaPrBad = (!ok || vbbaPrLast > 949000u) ? 1u : 0u;
++	MS_ST(MSS_TOP);
++}
+ static void vg_diag_10s(u32 t)
+ {
+ 	static u32 logok;
+ 	dbgprintf("LOGOK %u errs %u open_err %u bytes %u\r\n", ++logok, dbgLogErrs, dbgLogOpenErr, dbgLogBytes);
+ 	dbgprintf("SDERR: cmd errs %u first %d cmd %u @%u | wr retry %u fail %u | bit0 clr %u v %X @%u last %u now %u\r\n", vbbaSdErrN, (int)vbbaSdErrRet, vbbaSdErrCmd, vbbaSdErrTick, vbbaSdWrRetry, vbbaSdWrFail, dbgBitN, dbgBitVal, dbgBitTick, dbgBitLast, read32(HW_TIMER));
++	if (vbbaCfgSdProbe || vbbaCfgNoSave) dbgprintf("SDPROBE: n %u ok %u fail %u first fail @%u | last %u max %u ms | pending %u ms | nosave skipped %u last @%u now %u\r\n", vbbaPrN, vbbaPrOk, vbbaPrFail, vbbaPrFailTick, vbbaPrLast / 1898u, vbbaPrMax / 1898u, vbbaPrBusy ? (u32)(read32(HW_TIMER) - (vbbaPrBusy & ~1u)) / 1898u : 0u, vbbaNoSaveN, vbbaNoSaveTick, read32(HW_TIMER));   /* */
+ 	dbgprintf("STALLMAX: longest %u ms at stage %u, now stage %u age %u ms, watchdog beats %u, entries %u\r\n", msCrumb.maxms, msCrumb.maxstage, msCrumb.stage, (u32)(read32(HW_TIMER) - msCrumb.t) / 1898u, msCrumb.wdbeat, msCrumb.n);   /* */   /* a run that ends abruptly has its last LOGOK; a stale file has none */
+ 	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
+ 	u32 c, d, ms = pt ? (t - pt) / 1898u : 0, s3 = vg_dg_find_s3(), hook = 0, vi, sf, bba = 0, bbad, ev[VGR_N], evd;
+diff --git a/kernel/vbba_glue.h b/kernel/vbba_glue.h
+--- a/kernel/vbba_glue.h
++++ b/kernel/vbba_glue.h
+@@ -26,6 +26,7 @@
+ void VBBAConfigLoad(void);
+ /* main, right after the "Game path" line (the SD log is on from there): logs the preset in force and the auto sweep position */
+ void VBBAConfigLog(void);
++void VBBASdProbeTick(void);   /* /vbba.cfg sdprobe=1 */
+ 
+ /* called by EXIUpdateRegistersNEW (from the vBBA thread) for channel 0, device 2 while vbbaActive */
+ void VBBAExiSelect(u32 chn, u32 dev);
+diff --git a/kernel/vbba_stall.h b/kernel/vbba_stall.h
+--- a/kernel/vbba_stall.h
++++ b/kernel/vbba_stall.h
+@@ -19,10 +19,11 @@
+ #define MSS_SOCK 11
+ #define MSS_MISC 12       /* Stream, OSReport, card change check */
+ #define MSS_RESET 13
++#define MSS_PROBE 14      /* the /vbba.cfg sdprobe=1 read of SD sector 0 (an SD request) */
+ #define MSS_LOG_OPEN 20   /* FatFs */
+ #define MSS_LOG_WRITE 21  /* FatFs */
+ #define MSS_LOG_SYNC 22   /* FatFs */
+-#define MSS_IS_FAT(s) ((s) == MSS_DI || (s) == MSS_SAVE || ((s) >= MSS_LOG_OPEN && (s) <= MSS_LOG_SYNC))
++#define MSS_IS_FAT(s) ((s) == MSS_DI || (s) == MSS_SAVE || (s) == MSS_PROBE || ((s) >= MSS_LOG_OPEN && (s) <= MSS_LOG_SYNC))
+ struct ms_crumb {
+ 	volatile u32 stage, t, n;       /* current stage, HW_TIMER at its entry, entries counted */
+ 	volatile u32 wd;                /* 1 while the watchdog thread is inside its own dbgprintf (the crumbs are then left alone) */

@@ -1,0 +1,78 @@
+# Multishine patch 0008-multishine-diag-net.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -1434,6 +1434,7 @@
+ #endif
+ #define VG_SC_BASE (9 + VG_ENG_LINES)
+ #define VG_TL_LINES (9 + VG_ENG_LINES + VG_SC_LINES)
++static u32 vgNetLn = 2;   /* net lines still to print after the current timeline set (2 = none) */
+ static u32 vgTlTick, vgTlMs, vgTlAt, vgTlNext = VBBA_TL_PERIOD_MS, vgTlK = VG_TL_LINES;   /* main thread only: HW_TIMER of the last whole ms, ms since the first VBBAUpdate of the run, second of the set, next set (ms), line in progress */
+ static bool vgTlInit = false;
+ 
+@@ -1700,6 +1701,32 @@
+    10s a: commands taken for service per channel and device class (card / BBA / other), BBA commands by kind (select, immediate, DMA), 'blocked' passes, all as total and delta.
+    10s b: proof of life of the PowerPC: VI retrace counter, scene_frames, the engine's hook-call counter (S3 block), each as value and delta; plus the BBA register events of section vg_reg_*.
+    The overlay's own frame counter has no fixed address that is known here; hook calls are the engine's per-frame counter and stand in for it. */
++/* what the guest transmitted into the virtual adapter and what the router did with it.  k 0: frames by type; k 1: ARP, port 53, UDP out, denied, DHCP.
++   tl = 0: "DIAG: 10s net" lines (inside the 10 s sample); tl = 1: "VBBA: tl@<sec> net" lines (after every timeline set).  Router counters are read as they are (plain loads, diagnostic). */
++static void vg_diag_net(u32 k, u32 tl, u32 sec)
++{
++	const struct vbba_router_stats *q;
++	if (!V) return;
++	q = &V->router.st;
++	if (k == 0) {
++		if (tl) dbgprintf("VBBA: tl@%u net frames: guest tx %u rx %u | arp %u udp %u ip-other %u non-ip %u | bad %u spoof %u\r\n", sec, q->tx_frames, vst->rx_frames, q->tx_f_arp, q->tx_f_udp, q->tx_f_ip_other, q->tx_f_nonip, q->tx_bad + q->tx_bad_csum, q->tx_spoof);
++		else dbgprintf("DIAG: 10s net frames: guest tx %u rx %u | arp %u udp %u ip-other %u non-ip %u | bad %u spoof %u\r\n", q->tx_frames, vst->rx_frames, q->tx_f_arp, q->tx_f_udp, q->tx_f_ip_other, q->tx_f_nonip, q->tx_bad + q->tx_bad_csum, q->tx_spoof);
++	} else {
++		if (tl) dbgprintf("VBBA: tl@%u net router: arp req %u answered %u ignored %u | udp53 %u udp-out %u denied %u | dhcp disc %u ack %u\r\n", sec, q->arp_req, q->arp_replies, q->arp_ignored, q->tx_dns, q->tx_udp, q->tx_denied, q->dhcp_disc, q->dhcp_ack);
++		else dbgprintf("DIAG: 10s net router: arp req %u answered %u ignored %u | udp53 %u udp-out %u denied %u | dhcp disc %u ack %u\r\n", q->arp_req, q->arp_replies, q->arp_ignored, q->tx_dns, q->tx_udp, q->tx_denied, q->dhcp_disc, q->dhcp_ack);
++	}
++}
++/* the first (up to 8) distinct frame headers the guest transmitted, each printed once, as soon as the main thread sees them */
++static void vg_diag_txhdr(void)
++{
++	static u32 printed;
++	while (V && printed < V->router.txhdr_n && printed < VBBA_TXHDR) {
++		const struct vbba_txhdr *h = &V->router.txhdr[printed];
++		u32 d = h->dip;
++		printed++;
++		dbgprintf("DIAG: guest tx frame #%u at %u ms: eth %04X proto %u dst %u.%u.%u.%u port %u src port %u arp op %u len %u\r\n", printed, vg_now_ms(NULL), h->eth, h->proto, d >> 24, (d >> 16) & 255u, (d >> 8) & 255u, d & 255u, h->dport, h->sport, h->op, h->len);
++	}
++}
+ static void vg_diag_10s(u32 t)
+ {
+ 	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
+@@ -1715,6 +1742,7 @@
+ 		exiServed[0][2] - pS[0][2], exiServed[1][2] - pS[1][2], exiServed[2][2] - pS[2][2]);
+ 	dbgprintf("DIAG: 10s bba cmds sel +%u (%u) imm +%u (%u) dma +%u (%u) | blocked +%u (%u)\r\n",
+ 		exiServedBba[0] - pB[0], exiServedBba[0], exiServedBba[1] - pB[1], exiServedBba[1], exiServedBba[2] - pB[2], exiServedBba[2], exiDiagBlocked - pBl, exiDiagBlocked);
++	vg_diag_net(0, 0, 0); vg_diag_net(1, 0, 0);
+ 	ev[0] = vgRegCnt[VGR_NCRA_RST_ON]; ev[1] = vgRegCnt[VGR_SR_ON]; ev[2] = vgRegCnt[VGR_NWAYC] + vgRegCnt[VGR_SIACTRL2]; ev[3] = vgRegCnt[VGR_DEVID] + vgRegCnt[VGR_ACSTART] + vgRegCnt[VGR_RESPONSE]; ev[4] = vgRegCnt[VGR_IMR];
+ 	evd = 0; for (d = 0; d < 5u; d++) evd += ev[d] - pEv[d];
+ 	dbgprintf("DIAG: 10s guest %s | vi %u (+%u) scene_frames %u (+%u) hook_calls %u (+%u)\r\n",
+@@ -1792,6 +1820,7 @@
+ 		{   /* register events of the guest's driver, posted-but-not-served commands, the 10 s counter lines */
+ 			static u32 last10;
+ 			vg_reg_drain();
++			vg_diag_txhdr();
+ 			vg_diag_posted(t);
+ 			if (!last10) last10 = t;
+ 			else if ((u32)(t - last10) >= 18980000u) { last10 = t; vg_diag_10s(t); }
+@@ -1849,8 +1878,9 @@
+ 	   same rule as GCNCard_Save; FatFs is not reentrant) or during a card-save hold.  The main-loop gap counter skips our own writes. */
+ 	if (!vgTlInit) { vgTlInit = true; vgTlTick = now; }
+ 	{ u32 d = (u32)(now - vgTlTick) / 1898u; vgTlTick += d * 1898u; vgTlMs += d; }     /* whole ms (HW_TIMER 1.898 MHz) */
+-	if (vgTlK >= VG_TL_LINES && vgTlMs >= vgTlNext) { vgTlK = 0; vgTlNext = vgTlMs + VBBA_TL_PERIOD_MS; vgTlAt = vgTlMs / 1000u; }
++	if (vgTlK >= VG_TL_LINES && vgTlMs >= vgTlNext) { vgTlK = 0; vgNetLn = 0; vgTlNext = vgTlMs + VBBA_TL_PERIOD_MS; vgTlAt = vgTlMs / 1000u; }
+ 	if (vgTlK < VG_TL_LINES && !DI_IRQ && !vgHold) { vg_tl_line(vgTlK++, vgTlAt); last_tick = read32(HW_TIMER); }
++	else if (vgTlK >= VG_TL_LINES && vgNetLn < 2u && !DI_IRQ && !vgHold) { vg_diag_net(vgNetLn++, 1, vgTlAt); last_tick = read32(HW_TIMER); }
+ }
+ 
+ void VBBAShutdown(void)

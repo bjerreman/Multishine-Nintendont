@@ -1,0 +1,30 @@
+# Multishine patch 0030-multishine-skip-usb-mount.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -781,7 +781,19 @@
+ 			break;
+ 		//check SD and USB on Wii and WiiU
+ 		u64 ms_bm0 = gettime();   // Multishine boot timing
+-		const WCHAR *devNameFF = MountDevice(i);
++		const WCHAR *devNameFF;
++		if (i == DEV_USB)   // Multishine the USB mount waits 10 s for a drive that is not there; skipped when the saved game is proven good on the SD card (ms_usb_skip in ms_disc_gate.c, usb.on forces the mount)
++		{
++			extern int ms_usb_skip(char *why, unsigned wn);
++			char ms_why[64];
++			if (ms_usb_skip(ms_why, sizeof ms_why))
++			{
++				ms_ota_logf("T boot mount_usb_ms 0 skip (%s)", ms_why);
++				continue;
++			}
++			ms_ota_logf("T boot usb_mount_needed (%s)", ms_why);
++		}
++		devNameFF = MountDevice(i);
+ 		ms_ota_logf("T boot mount_%s_ms %lu %s", i == DEV_SD ? "sd" : "usb", MS_SINCE(ms_bm0), devNameFF ? "ok" : "fail");
+ 		if (devNameFF && !foundOneDevice)
+ 		{

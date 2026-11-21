@@ -1,0 +1,106 @@
+# Multishine patch 0002-multishine-paths.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/Config.c b/kernel/Config.c
+index 3bbae7f..ed162d8 100644
+--- a/kernel/Config.c
++++ b/kernel/Config.c
+@@ -20,7 +20,7 @@ void ConfigInit( void )
+ 	if (ncfg->Magicbytes != 0x01070CF6)
+ 	{
+ 		dbgprintf("Cfg not in memory, trying file\r\n");
+-		if (f_open_char(&cfg, "/nincfg.bin", FA_OPEN_EXISTING | FA_READ) != FR_OK)
++		if (f_open_char(&cfg, "/multishine/nincfg.bin", FA_OPEN_EXISTING | FA_READ) != FR_OK)
+ 		{
+ 			dbgprintf("CFG:Failed to open config\r\n");
+ 			Shutdown();
+diff --git a/kernel/GCNCard.c b/kernel/GCNCard.c
+index 00bdaeb..d2859c9 100644
+--- a/kernel/GCNCard.c
++++ b/kernel/GCNCard.c
+@@ -107,8 +107,8 @@ int GCNCard_Load(int slot)
+ 	// Set up the Memory Card context.
+ 	GCNCard_ctx *const ctx = &memCard[slot];
+ 	GCNCard_InitCtx(ctx);
+-	memcpy(ctx->filename, "/saves/", 7);
+-	char *fname_ptr = &ctx->filename[7];
++	memcpy(ctx->filename, "/multishine/saves/", 18);      /* Multishine: its own card folder, apart from stock Nintendont's /saves */
++	char *fname_ptr = &ctx->filename[18];
+ 	if (ConfigGetConfig(NIN_CFG_MC_MULTI))
+ 	{
+ 		// "Multi" mode enabled. (one card for all saves, per region)
+diff --git a/loader/source/global.c b/loader/source/global.c
+index ce528fb..e114af2 100644
+--- a/loader/source/global.c
++++ b/loader/source/global.c
+@@ -325,7 +325,7 @@ bool LoadNinCFG(void)
+ {
+ 	bool ConfigLoaded = true;
+ 	FIL cfg;
+-	if (f_open_char(&cfg, "/nincfg.bin", FA_READ|FA_OPEN_EXISTING) != FR_OK)
++	if (f_open_char(&cfg, "/multishine/nincfg.bin", FA_READ|FA_OPEN_EXISTING) != FR_OK)
+ 		return false;
+ 
+ 	// Read the configuration file into memory.
+diff --git a/loader/source/main.c b/loader/source/main.c
+index 1dd7e7c..bc73cea 100644
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -805,7 +805,7 @@ int main(int argc, char **argv)
+ 			ncfg->Version = NIN_CFG_VERSION;
+ 			ncfg->Language = NIN_LAN_AUTO;
+ 			ncfg->MaxPads = NIN_CFG_MAXPAD;
+-			ncfg->MemCardBlocks = 0x2;//251 blocks
++			ncfg->MemCardBlocks = 0x4;//1019 blocks (Multishine standard)
+ 			ncfg->Config |= NIN_CFG_MEMCARDEMU;     /* Multishine defaults: emulated memory card, progressive scan (see also the forced BBA below) */
+ 			ncfg->VideoMode |= NIN_VID_PROG;
+ 		}
+@@ -937,7 +937,8 @@ int main(int argc, char **argv)
+ 
+ 		// Write config to the boot device, which is loaded on next launch.
+ 		FIL cfg;
+-		if (f_open_char(&cfg, "/nincfg.bin", FA_WRITE|FA_OPEN_ALWAYS) == FR_OK)
++		f_mkdir_char("/multishine");
++		if (f_open_char(&cfg, "/multishine/nincfg.bin", FA_WRITE|FA_OPEN_ALWAYS) == FR_OK)
+ 		{
+ 			// Reserve space in the file.
+ 			if (f_size(&cfg) < sizeof(NIN_CFG)) {
+@@ -951,8 +952,10 @@ int main(int argc, char **argv)
+ 		}
+ 
+ 		// Write config to the game device, used by the Nintendont kernel.
+-		char ConfigPath[20];
+-		snprintf(ConfigPath, sizeof(ConfigPath), "%s:/nincfg.bin", GetRootDevice());
++		char ConfigPath[40];
++		snprintf(ConfigPath, sizeof(ConfigPath), "%s:/multishine", GetRootDevice());
++		f_mkdir_char(ConfigPath);
++		snprintf(ConfigPath, sizeof(ConfigPath), "%s:/multishine/nincfg.bin", GetRootDevice());
+ 		if (f_open_char(&cfg, ConfigPath, FA_WRITE|FA_OPEN_ALWAYS) == FR_OK)
+ 		{
+ 			// Reserve space in the file.
+@@ -1068,8 +1071,10 @@ int main(int argc, char **argv)
+ 	{
+ 		// Memory card emulation is enabled.
+ 		// Set up the memory card file.
+-		char BasePath[20];
+-		snprintf(BasePath, sizeof(BasePath), "%s:/saves", GetRootDevice());
++		char BasePath[40];
++		snprintf(BasePath, sizeof(BasePath), "%s:/multishine", GetRootDevice());
++		f_mkdir_char(BasePath);
++		snprintf(BasePath, sizeof(BasePath), "%s:/multishine/saves", GetRootDevice());
+ 		f_mkdir_char(BasePath);
+ 
+ 		char MemCardName[8];
+@@ -1101,7 +1106,7 @@ int main(int argc, char **argv)
+ 			memcpy(MemCardName, &(ncfg->GameID), 4);
+ 		}
+ 
+-		char MemCard[32];
++		char MemCard[56];
+ 		snprintf(MemCard, sizeof(MemCard), "%s/%s.raw", BasePath, MemCardName);
+ 		gprintf("Using %s as Memory Card.\r\n", MemCard);
+ 		FIL f;

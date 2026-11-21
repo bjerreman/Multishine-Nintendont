@@ -1,0 +1,110 @@
+# Multishine patch 0020-multishine-sd-log-diag.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/SDI.c keeps its BSD-style notice; kernel/diskio.c keeps its FatFs (ChaN) notice; kernel/vsprintf.c (Linus Torvalds, GPL-2.0) keeps its notice; our changes in them are GPL-2.0-only like the rest.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/SDI.c b/kernel/SDI.c
+--- a/kernel/SDI.c
++++ b/kernel/SDI.c
+@@ -52,6 +52,8 @@
+  
+ static char _sd0_fs[] = "/dev/sdio/slot0";
+ 
++vu32 vbbaSdWrRetry, vbbaSdWrFail;   /* sector-write attempts that failed and were retried, writes that failed after all retries */
++vu32 vbbaSdErrN, vbbaSdErrRet, vbbaSdErrCmd, vbbaSdErrTick;   /* failed SD commands, the first failure (IOS return code, command, HW_TIMER) */
+ vu32 vbbaSdOps, vbbaSdBusy, vbbaSdLastEnd, vbbaSdMaxTicks;	/* Multishine: SD command counter, the vBBA releases its network start-up when the SD has been idle for a while */
+ static s32 __sdio_sendcommand(u32 cmd,u32 cmd_type,u32 rsp_type,u32 arg,u32 blk_cnt,u32 blk_size,void *buffer,void *reply,u32 rlen)
+ {
+@@ -83,6 +85,7 @@
+ 	} else
+ 		ret = IOS_Ioctl(__sd0_fd,IOCTL_SDIO_SENDCMD,&msg.request,sizeof(struct _sdiorequest),&msg.response,sizeof(struct _sdioresponse));
+ 
++	if(ret < 0) { if(!vbbaSdErrN++) { vbbaSdErrRet = (u32)ret; vbbaSdErrCmd = cmd; vbbaSdErrTick = *(volatile u32 *)0x0d800010; } }   /* */
+ 	if(reply && !(rlen>16))
+ 		memcpy(reply,&msg.response,rlen);
+ 
+diff --git a/kernel/diskio.c b/kernel/diskio.c
+--- a/kernel/diskio.c
++++ b/kernel/diskio.c
+@@ -52,6 +52,7 @@
+ /* Read Sector(s) [SD card]                                              */
+ /*-----------------------------------------------------------------------*/
+ 
++extern vu32 vbbaSdWrRetry, vbbaSdWrFail;   /* , kernel/SDI.c */
+ DRESULT disk_read_sd (
+ 	BYTE pdrv,		/* Physical drive nmuber to identify the drive */
+ 	BYTE *buff,		/* Data buffer to store read data */
+@@ -100,11 +101,13 @@
+ 	//turn on drive led
+ 	if (access_led) set32(HW_GPIO_OUT, GPIO_SLOT_LED);
+ 
+-	if( sdio_WriteSectors( sector, count, buff ) < 0 )
+-	{
+-		//turn off drive led
+-		if (access_led) clear32(HW_GPIO_OUT, GPIO_SLOT_LED);
+-		return RES_ERROR;
++	{	/* sector writes are idempotent.  The read path retries 10 times, the write path never retried.  The old test "sdio_WriteSectors < 0" tested a bool and could never fire, so a failed write was silently dropped: that stays (RES_OK), but the write is retried first and the failures are counted */
++		s32 wtry = 5;
++		while( !sdio_WriteSectors( sector, count, buff ) )
++		{
++			if( --wtry <= 0 ) { vbbaSdWrFail++; break; }
++			vbbaSdWrRetry++;
++		}
+ 	}
+ 
+ 	//turn off drive led
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -1913,10 +1913,13 @@
+ 	}
+ }
+ extern u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* kernel/vsprintf.c */
++extern u32 dbgBitN, dbgBitVal, dbgBitTick, dbgBitLast;   /* kernel/vsprintf.c, */
++extern vu32 vbbaSdErrN, vbbaSdErrRet, vbbaSdErrCmd, vbbaSdErrTick, vbbaSdWrRetry, vbbaSdWrFail;   /* kernel/SDI.c, */
+ static void vg_diag_10s(u32 t)
+ {
+ 	static u32 logok;
+ 	dbgprintf("LOGOK %u errs %u open_err %u bytes %u\r\n", ++logok, dbgLogErrs, dbgLogOpenErr, dbgLogBytes);
++	dbgprintf("SDERR: cmd errs %u first %d cmd %u @%u | wr retry %u fail %u | bit0 clr %u v %X @%u last %u now %u\r\n", vbbaSdErrN, (int)vbbaSdErrRet, vbbaSdErrCmd, vbbaSdErrTick, vbbaSdWrRetry, vbbaSdWrFail, dbgBitN, dbgBitVal, dbgBitTick, dbgBitLast, read32(HW_TIMER));
+ 	dbgprintf("STALLMAX: longest %u ms at stage %u, now stage %u age %u ms, watchdog beats %u, entries %u\r\n", msCrumb.maxms, msCrumb.maxstage, msCrumb.stage, (u32)(read32(HW_TIMER) - msCrumb.t) / 1898u, msCrumb.wdbeat, msCrumb.n);   /* */   /* a run that ends abruptly has its last LOGOK; a stale file has none */
+ 	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
+ 	u32 c, d, ms = pt ? (t - pt) / 1898u : 0, s3 = vg_dg_find_s3(), hook = 0, vi, sf, bba = 0, bbad, ev[VGR_N], evd;
+diff --git a/kernel/vsprintf.c b/kernel/vsprintf.c
+--- a/kernel/vsprintf.c
++++ b/kernel/vsprintf.c
+@@ -25,6 +25,7 @@
+ static int file_opened = -1;
+ u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* write errors, bytes written, last open error + 1 (0 = none); read by the vBBA glue for the LOGOK lines */
+ static u32 dbgTrunc;
++u32 dbgBitN, dbgBitVal, dbgBitTick, dbgBitLast, dbgBitNoted;   /* how often the 0x0D800070 bit 0 test read clear, the first value, the first tick */
+ static int dbgFirstOpen = 1;                   /* the first open of a run truncates the file (FA_CREATE_ALWAYS), later re-opens append */
+ vu32 SDisInit=0;
+ 
+@@ -312,8 +313,13 @@
+ {
+ 	va_list args;
+ 
+-	if ( (*(vu32*)(0xd800070) & 1) == 0)
+-		return -1;
++	{	/* stock Nintendont stops logging for good when bit 0 of the Hollywood register 0x0D800070 is clear.  The logs of ..die right after the first IOS network submission while the game keeps running and no write error is counted: this test is the one silent switch in the path.  Remember when it first reads clear (count, value, HW_TIMER), keep logging anyway and say so in the log (LOGBIT) */
++		u32 hw70 = *(vu32*)(0xd800070);
++		if ((hw70 & 1) == 0) {
++			if (!dbgBitN++) { dbgBitVal = hw70; dbgBitTick = read32(HW_TIMER); }
++			dbgBitLast = read32(HW_TIMER);
++		}
++	}
+ 	
+ 	//char *buffer = (char*)heap_alloc_aligned( 0, 2048, 32 );	
+ 	char buffer[0x100]; //get from stack
+@@ -355,6 +361,7 @@
+ 			MS_ST(MSS_LOG_SYNC);
+ 			if (f_sync(&dbgfile) != FR_OK) dbgLogErrs++;
+ 		}
++		if (dbgBitN && !dbgBitNoted && file_opened == FR_OK) { dbgBitNoted = 1; dbgprintf("LOGBIT: Hollywood 0x0D800070 bit 0 read clear (value %08X) at tick %u (now tick %u, x%u so far); logging continues (final32)\r\n", dbgBitVal, dbgBitTick, read32(HW_TIMER), dbgBitN); }
+ 		MS_ST(msSaved ? msSaved : MSS_TOP);   /* back to the caller's stage (a fresh timestamp: the log write finished) */
+ 	}
+ 

@@ -1,0 +1,136 @@
+# Multishine patch 0030-multishine-wc24-suspend.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -290,6 +290,7 @@
+ static int vgNetQueue = -1; static u8 *vgNetQueueHeap; static u32 *vgNetStack; static u32 vgNetThread;
+ #define VG_JOB_GETIP 100u
+ #define VG_JOB_HOSTID 101u
++#define VG_JOB_WC24 102u      /* (patch 0030): WiiConnect24 scheduler pause, one blocking kd/request ioctl on the helper thread */
+ #define VBBA_NET_STACK 0x1000u
+ #ifndef VBBA_NET_PRIO
+ #define VBBA_NET_PRIO 0x20
+@@ -423,6 +424,9 @@
+ 	sync_before_read((void *)a, len);
+ }
+ 
++#ifndef VBBA_WC24
++#define VBBA_WC24 1         /* (patch 0030, NIN_MS_WC24=1): pause WiiConnect24's scheduler (kd/request ioctl 1) once the address is up and resume it (ioctl 3) at shutdown; the design notes section 9; UNTESTED ON A CONSOLE */
++#endif
+ #ifndef VBBA_ROAM
+ #define VBBA_ROAM 1         /* (patch 0029, NIN_MS_ROAM=1): switch the Wi-Fi driver's roaming scan off (WLC iovar roam_off = 1 on /dev/wl0), the design notes section 9; UNTESTED ON A CONSOLE */
+ #endif
+@@ -477,6 +481,57 @@
+ }
+ #endif
+ 
++#if VBBA_WC24
++static u32 *vgWcOut;                      /* 32 bytes, 32-aligned (heap), allocated by the main thread */
++static volatile s32 vgWcState, vgWcRc;    /* 0 idle, 1 posted, 2 paused, -1 failed; the ioctl's result */
++static volatile u32 vgWcPrev;             /* the answer word: 0 = it was running */
++/* MAIN THREAD: 4 s after the address first appears, hand the pause to the helper thread (once); log its outcome when it is back. */
++static void vg_wc24(void)
++{
++	static u32 t0, logged;
++	u32 now;
++	if (!vgGotIp || vgHeap < 0 || vgNetQueue < 0 || logged) return;
++	now = vg_now_ms(NULL);
++	if (vgWcState == 0) {
++		if (!t0) { t0 = now | 1u; return; }
++		if ((s32)(now - t0) < 4000) return;
++		vgWcOut = (u32 *)heap_alloc_aligned(vgHeap, 32, 32);
++		if (!vgWcOut) { logged = 1; dbgprintf("VBBA: wc24: out of memory\r\n"); return; }
++		vgWcState = 1;
++		if (mqueue_send_now(vgNetQueue, (void *)((1u << 8) | VG_JOB_WC24), 0) < 0) { vgWcState = -1; logged = 1; dbgprintf("VBBA: wc24: could not post\r\n"); }
++		return;
++	}
++	if (vgWcState == 1) { if ((s32)(now - t0) > 60000) { logged = 1; dbgprintf("VBBA: wc24: still waiting after 60 s\r\n"); } return; }
++	logged = 1;
++	dbgprintf("VBBA: wc24: %s rc %d (previous %d: %s)\r\n", vgWcState == 2 ? "suspended" : "suspend FAILED", (int)vgWcRc, (int)vgWcPrev, vgWcPrev == 0 ? "it was running" : "it was paused already");
++}
++/* GAME EXIT (vgGameLogBegin) and SHUTDOWN: the scheduler as it was (only after our own pause went through; a pause still pending is cancelled by the
++   handle close).  Runs once: the first caller resumes, later calls find state 3. */
++static s32 vgWcResRc = 1;                 /* 1 = not resumed (yet) */
++static void vg_wc24_resume(void)
++{
++	if (vgWcState != 2 || kdFd < 0 || !vgWcOut || vgWcPrev != 0) return;     /* paused already before us: leave it paused */
++	vgWcOut[0] = 0; sync_after_write(vgWcOut, 32);
++	vgWcResRc = IOS_Ioctl(kdFd, 3, NULL, 0, vgWcOut, 32);
++	vgWcState = 3;
++	dbgprintf("VBBA: wc24: resumed rc %d\r\n", (int)vgWcResRc);
++}
++/* one summary block for /multishine/game.log (sdumpf tees into it), called by vgGameLogBegin; resumes WiiConnect24 first (game exit) */
++void VBBAWifiGameLog(void)
++{
++	extern int sdumpf(const char *fmt, ...);
++#if VBBA_ROAM
++	if (vgRoamWas < 0) sdumpf("GAMELOG: roam: not set (interface kind %u: 1 = Wi-Fi; first read rc %d)\r\n", vgCfgKind, (int)vgRoamRc);
++	else sdumpf("GAMELOG: roam: was %s, set off rc %d, now %s, %u set(s) in this run\r\n", vgRoamWas ? "off" : "on", (int)vgRoamRc, vgRoamNow ? "OFF" : "still ON", vgRoamSets);
++#endif
++	if (vgWcState == 2 || vgWcState == 3) sdumpf("GAMELOG: wc24: suspended rc %d (previous %d)\r\n", (int)vgWcRc, (int)vgWcPrev);
++	else sdumpf("GAMELOG: wc24: not suspended (state %d rc %d)\r\n", (int)vgWcState, (int)vgWcRc);
++	vg_wc24_resume();
++	if (vgWcState == 3) sdumpf("GAMELOG: wc24: resumed rc %d\r\n", (int)vgWcResRc);
++	else if (vgWcState == 2) sdumpf("GAMELOG: wc24: left paused (it was paused before this run, previous %d)\r\n", (int)vgWcPrev);
++}
++#endif
++
+ #if VBBA_MACPUB   /* */
+ static void vg_mac_pub_init(void)
+ {
+@@ -890,6 +945,20 @@
+ }
+ #endif
+ 
++#if VBBA_WC24
++/* HELPER THREAD (blocking: if the scheduler is mid-transfer the call returns when it has finished; only this thread waits, nobody serves EXI here). */
++static void vg_wc24_run(void)
++{
++	s32 rc;
++	if (kdFd < 0 || !vgWcOut) { vgWcRc = -1; vgWcState = -1; return; }
++	vgWcOut[0] = 0; sync_after_write(vgWcOut, 32);
++	rc = IOS_Ioctl(kdFd, 1, NULL, 0, vgWcOut, 32);
++	sync_before_read(vgWcOut, 32);
++	vgWcRc = rc; vgWcPrev = vgWcOut[0];
++	vgWcState = (rc < 0 || (s32)vgWcOut[0] < 0) ? -1 : 2;
++}
++#endif
++
+ /* completion thread: the only blocking receive on our queue (pattern of kernel/sock.c SOCKAlarm) */
+ static u32 VBBANetThread(void *arg)
+ {
+@@ -901,6 +970,9 @@
+ 		int rc;
+ 		mqueue_recv(vgNetQueue, &m, 0);
+ 		v = (u32)m; st = v & 255u; s = &slots[(v >> 8) - 1u];
++#if VBBA_WC24
++		if (st == VG_JOB_WC24) { vg_wc24_run(); continue; }          /* not a start-up step: the slot is not used */
++#endif
+ 		if (st == VG_JOB_GETIP) {
+ 			s->vec[0].data = &s->params[0];  s->vec[0].len = 8;
+ 			s->vec[1].data = &s->params[8];  s->vec[1].len = 4;
+@@ -2227,6 +2299,9 @@
+ #if VBBA_ROAM
+ 	vg_roam();
+ #endif
++#if VBBA_WC24
++	vg_wc24();
++#endif
+ #if VBBA_WIRED && !VBBA_QUIET
+ 	vg_ifmac_again();                                   /* second and third ip/top MAC answers, logged only */
+ #endif
+@@ -2271,6 +2346,9 @@
+ 		}
+ 		if (ncdFd >= 0) { IOS_Close(ncdFd); ncdFd = -1; }
+ 		if (ipFd >= 0) { IOS_Close(ipFd); if (ipFd == sockFd) sockFd = -1; ipFd = -1; ipOwn = false; }
++#if VBBA_WC24
++		vg_wc24_resume();
++#endif
+ 		if (kdFd >= 0) { IOS_Close(kdFd); if (kdFd == nwcFd) nwcFd = -1; kdFd = -1; kdOwn = false; }
+ 		left = n0;
+ 		for (w = 0; w < 150u && left; w++) {

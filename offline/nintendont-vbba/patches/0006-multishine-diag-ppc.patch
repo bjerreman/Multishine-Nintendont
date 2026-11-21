@@ -1,0 +1,304 @@
+# Multishine patch 0006-multishine-diag-ppc.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/EXI.c b/kernel/EXI.c
+--- a/kernel/EXI.c
++++ b/kernel/EXI.c
+@@ -698,6 +698,7 @@
+ static struct exidiag exiDiagRing[64];
+ static u32 exiDiagHead;
+ u32 exiDiagCmds, exiDiagLastTick, exiDiagBlocked, exiDiagSlowTicks, exiDiagSlowW0;
++u32 exiServed[4][3], exiServedBba[4];
+ static void EXIDiagRec( u32 command )
+ {
+ 	u32 chn = (command >> 24) == 0x10 ? (command & 0xFF) : ((command >> 20) & 0xF);
+@@ -705,6 +706,8 @@
+ 	e->tick = read32(HW_TIMER); e->w0 = command; e->w1 = read32(EXI_CMD_1);
+ 	e->dev = (command >> 24) == 0x10 ? (u8)((command >> 8) & 0xFF) : EXIDeviceSelect[chn & 3];
+ 	exiDiagCmds++; exiDiagLastTick = e->tick;
++	exiServed[chn & 3u][e->dev == 0 ? 0 : e->dev == 2 ? 1 : 2]++;          /* every command taken for service, per channel and device class (0 card, 1 BBA, 2 other) */
++	if (e->dev == 2) { u32 k = (command >> 24) - 0x10u; exiServedBba[k < 3u ? k : 3u]++; }   /* BBA commands by kind: select, immediate, DMA, other */
+ }
+ static void EXIDiagEnd( u32 command )
+ {
+diff --git a/kernel/EXI.h b/kernel/EXI.h
+--- a/kernel/EXI.h
++++ b/kernel/EXI.h
+@@ -76,6 +76,7 @@
+ /* one pass of EXI service: the fake EXI interrupt timer, then one command (Multishine vBBA thread; the main loop does the same while the thread is off) */
+ int EXIServiceStep( void );
+ extern u32 exiDiagCmds, exiDiagLastTick, exiDiagBlocked, exiDiagSlowTicks, exiDiagSlowW0;
++extern u32 exiServed[4][3], exiServedBba[4];
+ u32 EXIDiagCount( void );
+ void EXIDiagEvent( u32 back, u32 now, char *out );
+ void EXIDiagState( u32 *o );
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -240,6 +240,7 @@
+ #endif
+ static u32 vgLazyT0;
+ static bool vgLinkLogged;
++static u32 vgFirstSelTick, vgLinkTick;   /* (diagnostic only): HW_TIMER of the first guest select of the BBA (ch0 dev2) and of the moment the link-up was seen; 0 = not yet */
+ #ifndef VBBA_NET_DELAY_S
+ #define VBBA_NET_DELAY_S 0  /* test builds (NIN_MS_NETDELAY): a fixed delay in seconds instead of the activity-based release; every network IOS submit is refused (the transport retries every second) until then */
+ #endif
+@@ -895,14 +896,79 @@
+ }
+ 
+ /* ---- EXI hooks (called by EXIUpdateRegistersNEW from the vBBA thread) ---- */
++/* (diagnostic only): what the guest's driver writes to the adapter that looks like a (re)start, seen at the EXI hooks.  The fast thread only stores raw ticks into a small ring
++   (no log call from the thread); the main thread prints them (vg_reg_drain) and totals them in the 10 s line.  Register port write = 4-byte immediate 'C0 AA AA xx', the data follows
++   as the next immediate or DMA of the same select; command port write = immediate 'cmd data'.  Events: NCRA (reg 0x00) RESET bit or RX-enable (SR) bit changes, NWAYC (0x30) and
++   SIACTRL2 (0x60) writes (link re-init), IMR (0x08) changes, command port 0x44 (device id), 0x45 (acstart), 0x49 (challenge response) = the authentication handshake starting over. */
++enum { VGR_NCRA_RST_ON = 0, VGR_NCRA_RST_OFF, VGR_SR_ON, VGR_SR_OFF, VGR_NWAYC, VGR_SIACTRL2, VGR_IMR, VGR_DEVID, VGR_ACSTART, VGR_RESPONSE, VGR_N };
++static const char *const vgRegName[VGR_N] = { "NCRA RESET set", "NCRA RESET cleared", "NCRA SR (rx enable) set", "NCRA SR (rx enable) cleared", "NWAYC written (link re-init)", "SIACTRL2 written", "IMR changed", "cmd 0x44 device id (handshake start)", "cmd 0x45 acstart", "cmd 0x49 challenge response" };
++struct vg_regev { u32 tick; u16 kind, val; };
++static struct vg_regev vgRegRing[32];
++static volatile u32 vgRegHead, vgRegTail, vgRegLost;
++static u32 vgRegCnt[VGR_N], vgRegAddr = 0xFFFFFFFFu, vgRegPrevNcra, vgRegPrevImr = 0x100u;
++static void vg_reg_ev(u32 kind, u32 val)
++{
++	vgRegCnt[kind]++;
++	if (vgRegHead - vgRegTail >= 32u) { vgRegLost++; return; }
++	vgRegRing[vgRegHead & 31u].tick = read32(HW_TIMER); vgRegRing[vgRegHead & 31u].kind = (u16)kind; vgRegRing[vgRegHead & 31u].val = (u16)val;
++	vgRegHead++;
++}
++static void vg_reg_wr(u32 a, u32 v)
++{
++	v &= 0xFFu;
++	if (a == 0x00u) {
++		if ((v & 1u) && !(vgRegPrevNcra & 1u)) vg_reg_ev(VGR_NCRA_RST_ON, v);
++		if (!(v & 1u) && (vgRegPrevNcra & 1u)) vg_reg_ev(VGR_NCRA_RST_OFF, v);
++		if ((v & 8u) && !(vgRegPrevNcra & 8u)) vg_reg_ev(VGR_SR_ON, v);
++		if (!(v & 8u) && (vgRegPrevNcra & 8u)) vg_reg_ev(VGR_SR_OFF, v);
++		vgRegPrevNcra = v;
++	} else if (a == 0x30u) vg_reg_ev(VGR_NWAYC, v);
++	else if (a == 0x60u) vg_reg_ev(VGR_SIACTRL2, v);
++	else if (a == 0x08u) { if (v != vgRegPrevImr) vg_reg_ev(VGR_IMR, v); vgRegPrevImr = v; }
++}
++static void vg_reg_bytes(const u8 *b, u32 len)       /* the data bytes of a register-port write that follows its header */
++{
++	u32 i;
++	if (vgRegAddr == 0xFFFFFFFFu) return;
++	if (vgRegAddr == 0x48u) return;                  /* transmit FIFO port: frame bytes, no auto-increment */
++	for (i = 0; i < len && i < 8u; i++) vg_reg_wr(vgRegAddr + i, b[i]);
++	vgRegAddr += len;
++}
++static void vg_reg_imm(u32 data, u32 len)            /* immediate WRITE of 1..4 bytes, data left-aligned */
++{
++	u8 b[4]; u32 i;
++	for (i = 0; i < len && i < 4u; i++) b[i] = (u8)(data >> (24 - 8 * i));
++	if (vgRegAddr != 0xFFFFFFFFu) { vg_reg_bytes(b, len); return; }
++	if (len == 4u && (b[0] & 0xC0u) == 0xC0u) { vgRegAddr = ((u32)b[1] << 8) | b[2]; return; }   /* header of a register-port write */
++	if (len >= 2u) {
++		if (b[0] == 0x44u) vg_reg_ev(VGR_DEVID, b[1]);
++		else if (b[0] == 0x45u) vg_reg_ev(VGR_ACSTART, b[1]);
++		else if (b[0] == 0x49u) vg_reg_ev(VGR_RESPONSE, b[1]);
++	}
++}
++static void vg_reg_drain(void)                       /* main thread */
++{
++	while (vgRegTail != vgRegHead) {
++		struct vg_regev e = vgRegRing[vgRegTail & 31u];
++		vgRegTail++;
++		dbgprintf("DIAG: bba reg event %s (value %02X) %u ms ago, at %u ms\r\n", vgRegName[e.kind < VGR_N ? e.kind : 0], e.val, (read32(HW_TIMER) - e.tick) / 1898u, vg_now_ms(NULL));   /* longest name 36 characters */
++		dbgprintf("DIAG: bba reg totals rst %u sr-on %u nway %u siactrl2 %u handshake %u/%u/%u\r\n",
++			vgRegCnt[VGR_NCRA_RST_ON], vgRegCnt[VGR_SR_ON], vgRegCnt[VGR_NWAYC], vgRegCnt[VGR_SIACTRL2], vgRegCnt[VGR_DEVID], vgRegCnt[VGR_ACSTART], vgRegCnt[VGR_RESPONSE]);
++	}
++	if (vgRegLost) { dbgprintf("DIAG: bba reg events lost (ring full): %u\r\n", vgRegLost); vgRegLost = 0; }
++}
++
+ void VBBAExiSelect(u32 chn, u32 dev)
+ {
++	if (!vgFirstSelTick && chn == 0 && dev == 2) vgFirstSelTick = read32(HW_TIMER) | 1u;   /* raw tick only (no vg_now_ms: the helper threads use that clock too) */
++	vgRegAddr = 0xFFFFFFFFu;
+ 	if (V) (void)vbba_ndexi_select(&V->chip, &V->nx, chn, dev);
+ }
+ 
+ u32 VBBAExiImm(u32 data, u32 len, u32 mode)
+ {
+ 	if (!V) return 0;
++	if (mode == 1) vg_reg_imm(data, len);
+ 	return vbba_ndexi_imm(&V->chip, &V->nx, data, len, mode);
+ }
+ 
+@@ -911,6 +977,7 @@
+ 	u32 a = (u32)ptr & ~31u, n = round32(((u32)ptr & 31u) + len);
+ 	if (!V) return;
+ 	if (mode == 1) sync_before_read((void *)a, n);          /* guest -> chip: see the PowerPC's data */
++	if (mode == 1) vg_reg_bytes((const u8 *)ptr, len);
+ 	vbba_ndexi_dma(&V->chip, &V->nx, ptr, len, mode);
+ 	if (mode != 1) sync_after_write((void *)a, n);          /* chip -> guest: publish ours */
+ }
+@@ -1546,6 +1613,113 @@
+    L2 card: size, chg (1 = data changed, 2 = system area changed), current/low/high modified offsets, write count; sd = commands, longest ms, ms since the last one ended; hold = card save in progress.
+    L3-6 ev: the last 16 EXI commands newest last: '-ms ago kind/command word/data word dDevice' (kind 10 select, 11 immediate, 12 DMA).  L7: words of the game (scene state) that move while it runs. */
+ #define VG_DG(a) (*(const volatile u32 *)((a) & 0x01FFFFFFu))
++/* ---- (diagnostic only, reads only): is the PowerPC alive, and where did it stop?  Called at the end of vg_diag_dump (so only while the guest is silent for 5 s or an SD command hangs).
++   L8  s3:  the engine's own status block, found by its 'S3ST' magic (the card-route image base is not the lab/online one): state, hook calls and B0 calls (+ change since the previous DIAG set),
++            spin = the S20 breadcrumb BC(x) the PowerPC flushes with dcbst (0x01..0x06 hook, 0x1x EXI op started, 0x2xx issued and waiting in EXISync, 0x1xx finished), ip = the address the guest holds.
++   L9  ppc: VI retrace counter 0x804D7420 and scene_frames 0x80479D58 (+ change): both moving = the game runs (and the hook is not reached), retrace moving + scene frames still = the game thread is blocked,
++            both still = the PowerPC is stopped or has interrupts off.  CAVEAT: plain PowerPC stores can sit in its data cache: a still counter is strong evidence only together with the breadcrumb.
++   L10 irq: what the ARM has raised towards the PowerPC (PPCIRQFLAG/MASK, the four interrupt words, SI_IRQ, DI_IRQ): a bit raised and never taken = interrupts off on the PowerPC.
++   L11 time: first guest select of the BBA relative to the link-up signal (negative = the guest looked before the link was up). */
++#define VG_PM(a) ((const volatile u32 *)((a) & 0x01FFFFFFu))
++#define VG_S3_MAGIC 0x53335354u
++static u32 vgDgS3, vgDgScans, vgDgPrev[4], vgDgPrevT;
++static u32 vg_dg_find_s3(void)
++{
++	u32 a, i;
++	if (vgDgS3 || vgDgScans >= 3u) return vgDgS3;
++	vgDgScans++;
++	for (a = 0x80400000u; a < 0x80600000u; a += 0x20u) {         /* 2 MiB, 64 K cache-line invalidates, once per DIAG set until found (the guest is silent or the SD is stuck anyway) */
++		const volatile u32 *p = VG_PM(a);
++		sync_before_read((void *)p, 0x20);
++		for (i = 0; i < 8u; i++) {
++			if (p[i] == VG_S3_MAGIC) {
++				u32 c = a + 4u * i;
++				const volatile u32 *s = VG_PM(c);
++				sync_before_read((void *)((u32)s & ~31u), 0x120);
++				if (s[1] < 0x100u && s[39] < 0x1000u && s[3] != 0xFFFFFFFFu) { vgDgS3 = c; return c; }
++			}
++		}
++	}
++	return 0;
++}
++static void vg_diag_ppc(void)
++{
++	extern u32 SI_IRQ;
++	u32 t = read32(HW_TIMER), dt = vgDgPrevT ? (t - vgDgPrevT) / 1898u : 0, s3 = vg_dg_find_s3(), calls = 0, b0 = 0, vi, sf;
++	sync_before_read((void *)VG_PM(0x804D7420u), 0x20);
++	sync_before_read((void *)VG_PM(0x80479D40u), 0x20);
++	vi = VG_PM(0x804D7420u)[0]; sf = VG_PM(0x80479D58u)[0];
++	if (s3) {
++		const volatile u32 *s = VG_PM(s3);
++		sync_before_read((void *)((u32)s & ~31u), 0x120);
++		calls = s[3]; b0 = s[5];
++		dbgprintf("DIAG: s3 @%08X state %X calls %u (+%u) b0 %u (+%u) spin %X ip %08X in %u ms\r\n", s3, s[1], calls, calls - vgDgPrev[0], b0, b0 - vgDgPrev[1], s[39], s[4], dt);
++	} else dbgprintf("DIAG: s3 not found in 80400000..80600000 (scan %u)\r\n", vgDgScans);
++	dbgprintf("DIAG: ppc vi %u (+%u) scene_frames %u (+%u) in %u ms | guest %s\r\n", vi, vi - vgDgPrev[2], sf, sf - vgDgPrev[3], dt,
++		!vgDgPrevT ? "first sample" : (vi != vgDgPrev[2] || sf != vgDgPrev[3] || (s3 && calls != vgDgPrev[0])) ? "ALIVE (a retrace, scene frame or hook counter moved)" : "NO COUNTER MOVED (stopped, or its stores sit in the data cache)");
++	sync_before_read((void *)INT_BASE, 0x80);
++	dbgprintf("DIAG: irq ppcflag %08X mask %08X | RSW %08X DI %08X SI %08X EXI %08X | si_irq %02X di_irq %u\r\n", read32(HW_PPCIRQFLAG), read32(HW_PPCIRQMASK), read32(RSW_INT), read32(DI_INT), read32(SI_INT), read32(EXI_INT), SI_IRQ & 0xFFu, (u32)DI_IRQ);
++	{   /* L12 exi: a command the PowerPC has posted and the kernel has not taken (cmd0 != 0) with the EXI lock free = nothing is serving it; lock HELD with the main loop between passes = a leaked lock */
++		u32 c0, c1, got;
++		sync_before_read((void *)EXI_BASE, 0x20);
++		c0 = read32(EXI_CMD_0); c1 = read32(EXI_CMD_1);
++		got = (u32)EXILockTry(); if (got) EXIUnlock();
++		dbgprintf("DIAG: exi posted cmd0 %08X cmd1 %08X lock %s | card-save holds %u, last began %u ms ago\r\n", c0, c1, got ? "free" : "HELD", vst->holds, vgHoldTicks ? (t - vgHoldTicks) / 1898u : 0u);
++	}
++	if (vgFirstSelTick && vgLinkTick) dbgprintf("DIAG: time first BBA select %d ms after link-up (%u ms ago)\r\n", (int)((s32)(vgFirstSelTick - vgLinkTick) / 1898), (t - vgFirstSelTick) / 1898u);
++	else dbgprintf("DIAG: time first BBA select %s, link-up %s\r\n", vgFirstSelTick ? "seen" : "never", vgLinkTick ? "seen" : "never");
++	vgDgPrev[0] = calls; vgDgPrev[1] = b0; vgDgPrev[2] = vi; vgDgPrev[3] = sf; vgDgPrevT = t;
++}
++/* every 10 s, stall or not (so a stop is visible as a line whose '+' deltas go to 0):
++   10s a: commands taken for service per channel and device class (card / BBA / other), BBA commands by kind (select, immediate, DMA), 'blocked' passes, all as total and delta.
++   10s b: proof of life of the PowerPC: VI retrace counter, scene_frames, the engine's hook-call counter (S3 block), each as value and delta; plus the BBA register events of section vg_reg_*.
++   The overlay's own frame counter has no fixed address that is known here; hook calls are the engine's per-frame counter and stand in for it. */
++static void vg_diag_10s(u32 t)
++{
++	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
++	u32 c, d, ms = pt ? (t - pt) / 1898u : 0, s3 = vg_dg_find_s3(), hook = 0, vi, sf, bba = 0, bbad, ev[VGR_N], evd;
++	sync_before_read((void *)VG_PM(0x804D7420u), 0x20);
++	sync_before_read((void *)VG_PM(0x80479D40u), 0x20);
++	vi = VG_PM(0x804D7420u)[0]; sf = VG_PM(0x80479D58u)[0];
++	if (s3) { const volatile u32 *s = VG_PM(s3); sync_before_read((void *)((u32)s & ~31u), 0x120); hook = s[3]; }
++	for (c = 0; c < 4u; c++) bba += exiServed[c][1];
++	bbad = bba - pBbaD;
++	dbgprintf("DIAG: 10s %u ms | served card ch0 +%u (%u) ch1 +%u ch2 +%u\r\n", ms, exiServed[0][0] - pS[0][0], exiServed[0][0], exiServed[1][0] - pS[1][0], exiServed[2][0] - pS[2][0]);
++	dbgprintf("DIAG: 10s served bba ch0 +%u (%u) ch1 +%u ch2 +%u | other ch0 +%u ch1 +%u ch2 +%u\r\n", exiServed[0][1] - pS[0][1], exiServed[0][1], exiServed[1][1] - pS[1][1], exiServed[2][1] - pS[2][1],
++		exiServed[0][2] - pS[0][2], exiServed[1][2] - pS[1][2], exiServed[2][2] - pS[2][2]);
++	dbgprintf("DIAG: 10s bba cmds sel +%u (%u) imm +%u (%u) dma +%u (%u) | blocked +%u (%u)\r\n",
++		exiServedBba[0] - pB[0], exiServedBba[0], exiServedBba[1] - pB[1], exiServedBba[1], exiServedBba[2] - pB[2], exiServedBba[2], exiDiagBlocked - pBl, exiDiagBlocked);
++	ev[0] = vgRegCnt[VGR_NCRA_RST_ON]; ev[1] = vgRegCnt[VGR_SR_ON]; ev[2] = vgRegCnt[VGR_NWAYC] + vgRegCnt[VGR_SIACTRL2]; ev[3] = vgRegCnt[VGR_DEVID] + vgRegCnt[VGR_ACSTART] + vgRegCnt[VGR_RESPONSE]; ev[4] = vgRegCnt[VGR_IMR];
++	evd = 0; for (d = 0; d < 5u; d++) evd += ev[d] - pEv[d];
++	dbgprintf("DIAG: 10s guest %s | vi %u (+%u) scene_frames %u (+%u) hook_calls %u (+%u)\r\n",
++		(!init) ? "first sample" : (vi != pVi || sf != pSf || hook != pHook) ? "ALIVE" : "NO COUNTER MOVED", vi, vi - pVi, sf, sf - pSf, hook, hook - pHook);
++	dbgprintf("DIAG: 10s bba reg events +%u: rst %u sr-on %u nway/siactrl2 %u handshake %u imr %u\r\n", evd, ev[0], ev[1], ev[2], ev[3], ev[4]);
++	if (init && bbad == 0) {
++		if (vi != pVi || sf != pSf || hook != pHook) dbgprintf("DIAG: 10s <== guest ALIVE but no BBA command served in this interval\r\n");
++		else dbgprintf("DIAG: 10s <== no BBA command served and no guest counter moved\r\n");
++	}
++	for (c = 0; c < 4u; c++) for (d = 0; d < 3u; d++) pS[c][d] = exiServed[c][d];
++	for (c = 0; c < 4u; c++) pB[c] = exiServedBba[c];
++	for (d = 0; d < 5u; d++) pEv[d] = ev[d];
++	pBl = exiDiagBlocked; pVi = vi; pSf = sf; pHook = hook; pBbaD = bba; pt = t; init = true;
++}
++/* a command is posted in EXI_CMD_0 (the guest asked for a select or transfer) and nothing takes it for more than 250 ms: one line every 3 s while that lasts */
++static void vg_diag_posted(u32 t)
++{
++	static u32 val, since, cmds, lastpr;
++	u32 c0, c1, chn, dev, st[10];
++	sync_before_read((void *)EXI_BASE, 0x20);
++	c0 = read32(EXI_CMD_0);
++	if (!(c0 & 0xFF000000u) || c0 != val || exiDiagCmds != cmds) { val = c0; cmds = exiDiagCmds; since = (c0 & 0xFF000000u) ? t : 0; return; }
++	if (!since || (u32)(t - since) <= 474500u || (lastpr && (u32)(t - lastpr) <= 5694000u)) return;
++	lastpr = t; c1 = read32(EXI_CMD_1); EXIDiagState(st);
++	if ((c0 >> 24) == 0x10u) { chn = c0 & 0xFFu; dev = (c0 >> 8) & 0xFFu; } else { chn = (c0 >> 20) & 0xFu; dev = chn < 3u ? (st[8] >> (16 - 8 * chn)) & 0xFFu : 0xFFu; }
++	{
++		u32 got = (u32)EXILockTry(); if (got) EXIUnlock();
++		dbgprintf("DIAG: exi cmd %08X/%08X posted %u ms ago and NOT served | target ch%u dev%u%s\r\n", c0, c1, (t - since) / 1898u, chn, dev, dev == 2 ? " (BBA)" : dev == 0 ? " (card)" : "");
++		dbgprintf("DIAG: exi not served: lock %s, fake irq pending %u, served %u, last served %u ms ago, blocked %u\r\n", got ? "free" : "HELD", st[0], exiDiagCmds, (t - exiDiagLastTick) / 1898u, exiDiagBlocked);
++	}
++}
+ static void vg_diag_dump(u32 idle_s, u32 sd_busy_ms)
+ {
+ 	u32 t = read32(HW_TIMER), st[10], cd[6], k, n = EXIDiagCount();
+@@ -1557,6 +1731,7 @@
+ 	for (k = 0; k < 16u; k += 4u) dbgprintf("DIAG: ev %s | %s | %s | %s\r\n", ev[k], ev[k + 1], ev[k + 2], ev[k + 3]);
+ 	sync_before_read((void *)(0x8046B6A0u & 0x01FFFFFFu), 0x40);
+ 	dbgprintf("DIAG: guest 80479D30=%08X 8046B6A8=%08X 8046B6A0=%08X 8046B6C4=%08X\r\n", VG_DG(0x80479D30u), VG_DG(0x8046B6A8u), VG_DG(0x8046B6A0u), VG_DG(0x8046B6C4u));
++	vg_diag_ppc();
+ }
+ #endif
+ 
+@@ -1588,6 +1763,13 @@
+ 			dbgprintf("DIAG: slow card cmd: EXI command %08X took %u ms\r\n", exiDiagSlowW0, exiDiagSlowTicks / 1898u);
+ 			exiDiagSlowTicks = 0; slow_print = t; slow_seen = true;
+ 		}
++		{   /* register events of the guest's driver, posted-but-not-served commands, the 10 s counter lines */
++			static u32 last10;
++			vg_reg_drain();
++			vg_diag_posted(t);
++			if (!last10) last10 = t;
++			else if ((u32)(t - last10) >= 18980000u) { last10 = t; vg_diag_10s(t); }
++		}
+ 		if (exiDiagCmds) {
+ 			u32 idle = t - exiDiagLastTick, sdb = vbbaSdBusy ? t - vbbaSdBusy : 0;
+ 			if (idle > 9490000u || sdb > 5694000u) {
+@@ -1606,8 +1788,21 @@
+ 	if (V && !vgLinkLogged) {              /* the chip reports 'link up' to the guest only once IOS has an address (router be_caps) */
+ 		struct vbba_frame_caps cc; const struct vbba_frame_backend *fb = vbba_router_backend(&V->router);
+ 		cc.link_up = 0;
+-		if (fb->get_capabilities(fb->context, &cc) == VBBA_OK && cc.link_up) { vgLinkLogged = true; dbgprintf("VBBA: link up signalled to the guest at %u ms\r\n", vg_now_ms(NULL)); }
++		if (fb->get_capabilities(fb->context, &cc) == VBBA_OK && cc.link_up) { vgLinkLogged = true; vgLinkTick = read32(HW_TIMER) | 1u; dbgprintf("VBBA: link up signalled to the guest at %u ms\r\n", vg_now_ms(NULL)); }
+ 	}
++	{   /* three one-shot milestone lines, so a healthy run also shows when the guest first looked at the adapter (relative to the link-up line), when DHCP was acked and when its first UDP datagram left */
++		static bool sel_seen, ack_seen, udp_seen;
++		if (!sel_seen && vgFirstSelTick) { sel_seen = true; dbgprintf("VBBA: first guest BBA select at %u ms\r\n", vg_now_ms(NULL)); }
++		if (!ack_seen && vst->x_dhcp_ack) { ack_seen = true; dbgprintf("VBBA: first DHCP ack at %u ms\r\n", vg_now_ms(NULL)); }
++		static u32 lease_acks;
++		if (V && V->router.st.dhcp_ack != lease_acks) {   /* every DHCP ACK: what the guest was handed (adds the resolver) */
++			const struct vbba_router *rt = &V->router; u32 ip = rt->lease_ip, gw = rt->router_ip, dn = rt->cfg.dns;
++			lease_acks = rt->st.dhcp_ack;
++			if (dn) dbgprintf("VBBA: lease ip %u.%u.%u.%u mask %08X gw %u.%u.%u.%u dns=%u.%u.%u.%u\r\n", ip >> 24, (ip >> 16) & 255u, (ip >> 8) & 255u, ip & 255u, rt->mask, gw >> 24, (gw >> 16) & 255u, (gw >> 8) & 255u, gw & 255u, dn >> 24, (dn >> 16) & 255u, (dn >> 8) & 255u, dn & 255u);
++			else dbgprintf("VBBA: lease ip %u.%u.%u.%u mask %08X gw %u.%u.%u.%u dns=none\r\n", ip >> 24, (ip >> 16) & 255u, (ip >> 8) & 255u, ip & 255u, rt->mask, gw >> 24, (gw >> 16) & 255u, (gw >> 8) & 255u, gw & 255u);
++		}
++		if (!udp_seen && vst->tx_udp) { udp_seen = true; dbgprintf("VBBA: first guest UDP datagram out at %u ms\r\n", vg_now_ms(NULL)); }
++	}
+ 	if (!vgNetReleased) {                  /* decided on the main thread only */
+ 		static u32 last_ops, last_chg; static bool ops_init;
+ 		u32 ms = vg_now_ms(NULL) - vgNetT0, ops = vbbaSdOps;      /* seconds since the vBBA started, not the absolute clock */
+@@ -1672,6 +1867,7 @@
+ 	dbgprintf("VBBA: stopped. selects %u imm %u dma %u (%u B) cmds %u\r\n", vst->selects, vst->imm, vst->dma, vst->dma_bytes, vst->cmds);
+ 	dbgprintf("VBBA: stopped: tx frames %u rx frames %u udp out %u in %u denied %u | net %u ip %08X startups %u\r\n",
+ 		vst->tx_frames, vst->rx_frames, vst->tx_udp, vst->rx_dgrams, vst->tx_denied, vst->net, vst->ip, vst->startups);
++	if (V) dbgprintf("VBBA: guest net: arp requests %u (answered %u, ignored %u), udp to port 53 %u, udp out %u, denied %u, dhcp discover %u ack %u\r\n", V->router.st.arp_req, V->router.st.arp_replies, V->router.st.arp_ignored, V->router.st.tx_dns, V->router.st.tx_udp, V->router.st.tx_denied, V->router.st.dhcp_disc, V->router.st.dhcp_ack);
+ 	dbgprintf("VBBA: idle sleeps %u (longest %u ticks for a %u us request; HW_TIMER ticks are 0.527 us), longest poll gap %u ticks\r\n",
+ 		vst->sleeps, vst->sleep_max_ticks, VBBA_IDLE_US, vst->spin_gap_max_ticks);
+ 	dbgprintf("VBBA: holds %u (longest %u ticks), startup rc %08X\r\n", vst->holds, vst->hold_max_ticks, vst->startup_rc);

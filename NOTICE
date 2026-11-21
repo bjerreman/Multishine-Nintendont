@@ -1,0 +1,16 @@
+Multishine Wii loader
+Copyright (C) 2026 Nigzel / Bjerreman (our files; see each file's SPDX line)
+
+The built program (stub, shell, kernel) is a modified version of Nintendont and is distributed under the GNU General
+Public License version 2 only (LICENSE). Source: this repository at the tag of the release, plus third_party/Nintendont
+at the pinned commit; the patch series in offline/nintendont-vbba/patches/ marks every change ("altered versions").
+
+Third-party components:
+* Nintendont (FIX94 and contributors), https://github.com/FIX94/Nintendont, commit bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5,
+  GPL-2.0: git submodule third_party/Nintendont, patched at build time; it bundles its own third-party code under its own notices.
+* libogc (devkitPro) and libfat, linked from the toolchain: zlib-style licences (with the RTEMS notice for libogc's threads).
+* offline/bba/bba_mx98728.[ch]: behaviour and constants that follow libogc / libogc2 (gcif.c), zlib licence (LICENSES/Zlib.txt).
+* Aileron typeface (Sora Sagano), CC0-1.0: docs/brand/Aileron-Regular.ttf, rendered into the shell's font.
+* GTS Root R1-R4 (Google Trust Services) public CA certificates compiled into offline/net/tls/sdroots.c.
+
+No Nintendo or Slippi data is in this repository: the loader reads the player's own Melee disc at run time.

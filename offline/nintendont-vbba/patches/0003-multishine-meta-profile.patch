@@ -1,0 +1,19 @@
+# Multishine patch 0003-multishine-meta-profile.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/loader/source/main.c b/loader/source/main.c
+index bc73cea..06b83bd 100644
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -135,6 +135,7 @@ static void updateMetaXml(void)
+ {
+ 	char filepath[MAXPATHLEN];
+ 	bool dir_argument_exists = strlen(launch_dir);
++	if (!dir_argument_exists) return;      // Multishine: never create or write /apps/Nintendont (the stock app); write only into our own launch dir
+ 	
+ 	snprintf(filepath, sizeof(filepath), "%smeta.xml",
+ 		dir_argument_exists ? launch_dir : "/apps/Nintendont/");

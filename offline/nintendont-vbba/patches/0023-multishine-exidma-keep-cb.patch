@@ -1,0 +1,98 @@
+# Multishine patch 0023-multishine-exidma-keep-cb.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/EXI.c b/kernel/EXI.c
+index e64ed34..caed737 100644
+--- a/kernel/EXI.c
++++ b/kernel/EXI.c
+@@ -933,6 +933,7 @@ static inline u32 exiSwap( volatile u32 *p, u32 v )
+ }
+ int EXILockTry( void ) { return exiSwap( &exiHolder, 1 ) == 0; }
+ void EXIUnlock( void ) { exiHolder = 0; }
++u32 exiTcCmdWait, exiTcCmdWaitDma, exiTcCmdLast;   /* */
+ int EXIServiceStep( void )
+ {
+ 	if( !EXILockTry() )
+@@ -940,7 +941,13 @@ int EXIServiceStep( void )
+ 	if( EXI_IRQ == true )
+ 	{
+ 		if( EXICheckTimer() )
++		{
++			u32 w;
++			sync_before_read( (void*)EXI_BASE, 0x20 );   /* (counted only): the guest already posted its next command when the transfer-complete interrupt goes out (a BBA transfer on top of a card transfer) */
++			w = read32(EXI_CMD_0);
++			if( w & 0xFF000000 ) { exiTcCmdWait++; exiTcCmdLast = w; if( (w >> 24) == 0x12 ) exiTcCmdWaitDma++; }
+ 			EXIInterrupt();
++		}
+ 	}
+ 	EXIUpdateRegistersNEW();
+ 	EXIUnlock();
+diff --git a/kernel/EXI.h b/kernel/EXI.h
+index dcb9628..07a04ef 100644
+--- a/kernel/EXI.h
++++ b/kernel/EXI.h
+@@ -85,6 +85,7 @@ void EXIPoke( u32 cause );
+ extern u32 ExiChanTabAddr;           /* guest address of the EXI channel table the patched EXIDMA uses (0 = not found) */
+ extern bool EXI_IRQ;
+ int EXIDiagLastIsCh0Dma( void );     /* the newest EXI command the guest posted was a channel 0 DMA */
++extern u32 exiTcCmdWait, exiTcCmdWaitDma, exiTcCmdLast;   /* transfer-complete interrupts sent out while the guest's next command was already waiting (and how many of those were DMAs) */
+ void EXIUnlock( void );
+ void EXIReadFontFile(u8* Data, u32 Length);
+ void EXIPrepareTRIGameStart();
+diff --git a/kernel/asm/EXIDMA.S b/kernel/asm/EXIDMA.S
+index a7ca99e..4c92cbd 100644
+--- a/kernel/asm/EXIDMA.S
++++ b/kernel/asm/EXIDMA.S
+@@ -23,7 +23,10 @@ EXIDMA:
+ 	bne		CallbackSet
+ 	addi		r8,	r8, CH_LENGTH		#mult instead? break channel2?
+ CallbackSet:
++	cmpwi		r7,	0		# a DMA without a callback (the BBA driver's synchronous transfers) must not erase the callback of a card transfer
++	beq		CallbackKeep		# whose completion interrupt has not been taken yet (EXILock is a stub here, nothing else keeps the two apart)
+ 	stw		r7,	0x4(r8)		# callback
++CallbackKeep:
+ 
+ 	lis		r8,	CH0_MASK
+ 	cmpwi		r3,	1
+@@ -43,12 +46,16 @@ MaskSet:
+ 	stw		r4,	EXI_CMD_1@l(r7)
+ 
+ ## IRQ function call
++	mfmsr		r9			# the read-modify-write of the OS interrupt mask word (0x800000C4) is atomic again (the SDK's __OSUnmaskInterrupts
++	rlwinm		r10,	r9,	0,	17,	15	# disables interrupts around it; an interrupt between the lwz and the stw undid the mask change of its handler)
++	mtmsr		r10
+ 	lis		r3,	0x8000
+ 	lwz		r4,	0xC4(r3)
+ 
+ 	andc	r4,	r4,	r8
+ 
+ 	stw		r4,	0xC4(r3)
++	mtmsr		r9
+ 
+ 	stw		r0,	EXI_CMD_0@l(r7)
+ ready_loop:
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index 8cb2499..99e82d6 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -337,7 +337,7 @@ static volatile u32 vgNoStart = (VBBA_OFF) & 64;
+ /* ARM duty cycle and its knobs (/vbba.cfg, see vg_read_cfg) */
+ static u32 vgAutoWrite, vgCfgState, vgCfgDuty, vgAutoInfo, vgBaked = 0xFFFFFFFFu;                /* what VBBAConfigLoad found (copied into the status block when the vBBA starts) */
+ static u32 vgSpinTicks = VBBA_SPIN_TICKS, vgIdleUs = VBBA_IDLE_US, vgPrio = VBBA_THREAD_PRIO, vgAdaptive = 0, vgMainUs = VBBA_MAIN_US;
+-static u32 vgCfgAuto = 4u, vgApAt, vgApRun, vgApTotal;   /* /vbba.cfg autopoke=SECONDS (default 4, 0 = off): the guest has been silent that long and its newest EXI command was a channel 0 DMA: its transfer-complete interrupt may have been lost; throw it again (at most 8 per silence, one per period) */
++static u32 vgCfgAuto = 0u, vgApAt, vgApRun, vgApTotal;   /* /vbba.cfg autopoke=SECONDS (default 4, 0 = off): the guest has been silent that long and its newest EXI command was a channel 0 DMA: its transfer-complete interrupt may have been lost; throw it again (at most 8 per silence, one per period) */
+ static u32 vgCfgPoke, vgPokeAt, vgPokes;      /* experiment switch /vbba.cfg irqpoke=SECONDS (0 = off, default): when the guest has posted no EXI command for N s, throw one spurious EXI transfer-complete interrupt (every 5 s at most): tests the lost-interrupt theory */
+ static u32 vgCfgNetDelayS, vgCfgNoBba, vgCfgNetEarly;   /* netearly=SECONDS (1..30) is netdelay with another log text: the net start is released N s after the vBBA started whatever the SD is doing (no SD-idle wait) */
+ /* test switches from /vbba.cfg: netdelay=SECONDS (net start not before N s after the vBBA started), nobba=1 (the vBBA is never started); both 0 = the behaviour */
+@@ -2011,6 +2011,7 @@ static void vg_diag_dump(u32 idle_s, u32 sd_busy_ms)
+ 	char ev[16][40];
+ 	EXIDiagState(st); GCNCard_DiagState(cd);
+ 	dbgprintf("DIAG: guest idle %u s, sd busy %u ms | exi: cmds %u blocked %u irq %u cause %u/%u/%u age %u ms int %08X sel %06X timing %u\r\n", idle_s, sd_busy_ms, st[6], st[7], st[0], st[1], st[2], st[3], st[4], st[5], st[8], st[9]);
++	dbgprintf("DIAG: exi overlap: TC sent with a guest command already waiting %u (DMA %u), last %08X\r\n", exiTcCmdWait, exiTcCmdWaitDma, exiTcCmdLast);   /* */
+ 	dbgprintf("DIAG: card size %u chg %u off %X low %X high %X wr %u | sd ops %u max %u ms last end %u ms ago | hold %u takeover %u\r\n", cd[0], cd[1], cd[2], cd[3], cd[4], cd[5], vbbaSdOps, vbbaSdMaxTicks / 1898u, (t - vbbaSdLastEnd) / 1898u, (u32)vgHold, (u32)vbbaTakeover);
+ 	for (k = 0; k < 16u; k++) { if (k < n) EXIDiagEvent(15u - k, t, ev[k]); else ev[k][0] = 0; }
+ 	for (k = 0; k < 16u; k += 4u) dbgprintf("DIAG: ev %s | %s | %s | %s\r\n", ev[k], ev[k + 1], ev[k + 2], ev[k + 3]);

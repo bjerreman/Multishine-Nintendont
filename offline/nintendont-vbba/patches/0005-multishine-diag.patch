@@ -1,0 +1,133 @@
+# Multishine patch 0005-multishine-diag.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/SDI.c keeps its BSD-style notice; our changes in them are GPL-2.0-only like the rest.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/EXI.c b/kernel/EXI.c
+index cf6aba0..952c911 100644
+--- a/kernel/EXI.c
++++ b/kernel/EXI.c
+@@ -692,10 +692,47 @@ u32 EXIDeviceSP1( u8 *Data, u32 Length, u32 Mode )
+ 	return 0;
+ }
+ 
++
++/* ---- Multishine diagnostics: main-context only, RAM only (the log is written by the vBBA glue) ---- */
++struct exidiag { u32 tick, w0, w1; u8 dev; };
++static struct exidiag exiDiagRing[64];
++static u32 exiDiagHead;
++u32 exiDiagCmds, exiDiagLastTick, exiDiagBlocked, exiDiagSlowTicks, exiDiagSlowW0;
++static void EXIDiagRec( u32 command )
++{
++	u32 chn = (command >> 24) == 0x10 ? (command & 0xFF) : ((command >> 20) & 0xF);
++	struct exidiag *e = &exiDiagRing[exiDiagHead++ & 63];
++	e->tick = read32(HW_TIMER); e->w0 = command; e->w1 = read32(EXI_CMD_1);
++	e->dev = (command >> 24) == 0x10 ? (u8)((command >> 8) & 0xFF) : EXIDeviceSelect[chn & 3];
++	exiDiagCmds++; exiDiagLastTick = e->tick;
++}
++static void EXIDiagEnd( u32 command )
++{
++	u32 dt = read32(HW_TIMER) - exiDiagLastTick;
++	if (dt > 949000u && (command >> 24) != 0x10) { exiDiagSlowTicks = dt; exiDiagSlowW0 = command; }      /* a command that took more than 500 ms to serve (card commands wait on the SD) */
++}
++u32 EXIDiagCount( void ) { return exiDiagHead; }
++void EXIDiagEvent( u32 back, u32 now, char *out )
++{
++	struct exidiag *e = &exiDiagRing[(exiDiagHead - 1 - back) & 63];
++	_sprintf( out, "-%ums %02X/%08X/%08X d%u", (now - e->tick) / 1898u, e->w0 >> 24, e->w0, e->w1, e->dev );
++}
++void EXIDiagState( u32 *o )
++{
++	sync_before_read( (void*)EXI_INT, 0x20 );
++	o[0] = EXI_IRQ; o[1] = IRQ_Cause[0]; o[2] = IRQ_Cause[1]; o[3] = IRQ_Cause[2];
++	o[4] = IRQ_Timer ? (read32(HW_TIMER) - IRQ_Timer) / 1898u : 0;
++	o[5] = read32(EXI_INT); o[6] = exiDiagCmds; o[7] = exiDiagBlocked;
++	o[8] = (EXIDeviceSelect[0] << 16) | (EXIDeviceSelect[1] << 8) | EXIDeviceSelect[2];
++	o[9] = CurrentTiming;
++}
+ void EXIUpdateRegistersNEW( void )
+ {
+ 	if( EXI_IRQ == true ) //still working
++	{
++		exiDiagBlocked++;
+ 		return;
++	}
+ 
+ 	//u32 chn, dev, frq, ret, data, len, mode;
+ 	u32 chn, dev, ret, data, len, mode;
+@@ -705,6 +742,7 @@ void EXIUpdateRegistersNEW( void )
+ 
+ 	if( command & 0xFF000000 )
+ 	{
++		EXIDiagRec( command );
+ 		switch( command >> 24 )
+ 		{
+ 			case 0x10:	// EXISelect
+@@ -859,6 +897,7 @@ void EXIUpdateRegistersNEW( void )
+ 			{
+ 			} break;
+ 		}
++		EXIDiagEnd( command );
+ 	}
+ }
+ 
+diff --git a/kernel/EXI.h b/kernel/EXI.h
+index a1ca262..ce4e65e 100644
+--- a/kernel/EXI.h
++++ b/kernel/EXI.h
+@@ -75,6 +75,10 @@ void EXIShutdown(void);
+ void EXIUpdateRegistersNEW( void );
+ /* one pass of EXI service: the fake EXI interrupt timer, then one command (Multishine vBBA thread; the main loop does the same while the thread is off) */
+ int EXIServiceStep( void );
++extern u32 exiDiagCmds, exiDiagLastTick, exiDiagBlocked, exiDiagSlowTicks, exiDiagSlowW0;
++u32 EXIDiagCount( void );
++void EXIDiagEvent( u32 back, u32 now, char *out );
++void EXIDiagState( u32 *o );
+ int EXILockTry( void );
+ void EXIUnlock( void );
+ void EXIReadFontFile(u8* Data, u32 Length);
+diff --git a/kernel/GCNCard.c b/kernel/GCNCard.c
+index d2859c9..108298a 100644
+--- a/kernel/GCNCard.c
++++ b/kernel/GCNCard.c
+@@ -56,6 +56,12 @@ u32 GCNCard_VbbaState(u32 *o)
+ }
+ #endif
+ 
++void GCNCard_DiagState(u32 *o)      /* Multishine read-only view for the DIAG log lines */
++{
++	const GCNCard_ctx *c = &memCard[0];
++	o[0] = c->size; o[1] = (c->changed ? 1u : 0u) | (c->changed_system ? 2u : 0u); o[2] = c->BlockOff; o[3] = c->BlockOffLow; o[4] = c->BlockOffHigh; o[5] = c->CARDWriteCount;
++}
++
+ static void GCNCard_InitCtx(GCNCard_ctx *ctx)
+ {
+ 	memset(ctx, 0, sizeof(*ctx));
+diff --git a/kernel/SDI.c b/kernel/SDI.c
+index bf8a609..b546bcd 100644
+--- a/kernel/SDI.c
++++ b/kernel/SDI.c
+@@ -52,10 +52,11 @@ static u8 *rw_buffer;
+  
+ static char _sd0_fs[] = "/dev/sdio/slot0";
+ 
+-vu32 vbbaSdOps;	/* Multishine: SD command counter, the vBBA releases its network start-up when the SD has been idle for a while */
++vu32 vbbaSdOps, vbbaSdBusy, vbbaSdLastEnd, vbbaSdMaxTicks;	/* Multishine: SD command counter, the vBBA releases its network start-up when the SD has been idle for a while */
+ static s32 __sdio_sendcommand(u32 cmd,u32 cmd_type,u32 rsp_type,u32 arg,u32 blk_cnt,u32 blk_size,void *buffer,void *reply,u32 rlen)
+ {
+ 	vbbaSdOps++;
++	vbbaSdBusy = (*(volatile u32 *)0x0d800010) | 1u;
+ 	struct _sdiomsg msg ALIGNED(32);
+ 	s32 ret;
+ 
+@@ -85,6 +86,7 @@ static s32 __sdio_sendcommand(u32 cmd,u32 cmd_type,u32 rsp_type,u32 arg,u32 blk_
+ 	if(reply && !(rlen>16))
+ 		memcpy(reply,&msg.response,rlen);
+ 
++	{ u32 t = *(volatile u32 *)0x0d800010; if (t - vbbaSdBusy > vbbaSdMaxTicks) vbbaSdMaxTicks = t - vbbaSdBusy; vbbaSdLastEnd = t; vbbaSdBusy = 0; }
+ 	return ret;
+ }
+ 

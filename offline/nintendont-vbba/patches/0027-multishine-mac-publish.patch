@@ -1,0 +1,80 @@
+# Multishine patch 0027-multishine-mac-publish.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff -ruN a/kernel/main.c b/kernel/main.c
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -224,7 +224,7 @@
+ 
+ 	if (ConfigGetConfig(NIN_CFG_LOG))
+ 		SDisInit = 1;  // Looks okay after threading fix
+-	dbgprintf("RUNID: game %s config %08X memcard blocks %u\r\n", ConfigGetGamePath(), ncfg->Config, (u32)ncfg->MemCardBlocks);   /* */
++	dbgprintf("RUNID: game %s config %08X memcard blocks %u netprofile %u\r\n", ConfigGetGamePath(), ncfg->Config, (u32)ncfg->MemCardBlocks, (u32)ncfg->NetworkProfile);   /* */
+ 	dbgprintf("Game path: %s\r\n", ConfigGetGamePath());
+ 	VBBAConfigLog(); /* Multishine vBBA: the duty preset in force (and the auto sweep position) at the start of the run block */
+ 
+diff -ruN a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -306,6 +306,10 @@
+ #else
+ #define VG_CRUMB(...) do {} while (0)
+ #endif
++#ifndef VBBA_MACPUB
++#define VBBA_MACPUB 1       /* the MAC of the interface in use (ip/top, once the address is up) is published to the PowerPC in 4 uncached words at ARM 0x13026680 (PPC 0xD3026680), so Settings > Network > Adapter shows the MAC to bind in the router without a Reconnect (the chip MAC the guest uses is unchanged: rule). Layout (engine side: glue/s17od/s12_macpub.h): w0 'VBMC', w1 sequence (odd = being written), w2 = m0<<24|m1<<16|m2<<8|m3, w3 = m4<<24|m5<<16|kind<<8|1 (kind: 1 wireless, 2 wired, 0 unknown; bit 0 = valid) */
++#endif
++#define VG_MACPUB_ADDR 0x13026680u
+ #ifndef VBBA_IFMAC_ON
+ #define VBBA_IFMAC_ON 1     /* ip/top interface-MAC query (getinterfaceopt 0x1004) once the address is up; the chip MAC follows it through vbba_chip_set_mac, which no longer touches the PAR registers a running guest has read (the lanmac test's UDP loss: the filter changed under a guest still sending with the old source MAC) */
+ #endif
+@@ -417,6 +421,26 @@
+ 	sync_before_read((void *)a, len);
+ }
+ 
++#if VBBA_MACPUB   /* */
++static void vg_mac_pub_init(void)
++{
++	volatile u32 *b = (volatile u32 *)VG_MACPUB_ADDR;
++	b[1] = 0; b[2] = 0; b[3] = 0; b[0] = 0x56424D43u;      /* 'VBMC' */
++	sync_after_write((void *)VG_MACPUB_ADDR, 16);
++}
++static void vg_mac_publish(const u8 *m, u32 kind)
++{
++	volatile u32 *b = (volatile u32 *)VG_MACPUB_ADDR; u32 seq = b[1] & ~1u;
++	b[1] = seq + 1u;                                            /* odd: being written */
++	sync_after_write((void *)VG_MACPUB_ADDR, 16);
++	b[2] = ((u32)m[0] << 24) | ((u32)m[1] << 16) | ((u32)m[2] << 8) | m[3];
++	b[3] = ((u32)m[4] << 24) | ((u32)m[5] << 16) | ((kind & 255u) << 8) | 1u;
++	sync_after_write((void *)VG_MACPUB_ADDR, 16);
++	b[1] = seq + 2u;                                            /* even: stable */
++	sync_after_write((void *)VG_MACPUB_ADDR, 16);
++}
++#endif
++
+ /* MAIN THREAD ONLY (IOS_Open is a blocking IPC call: it must never run on the fast EXI thread, nobody else serves EXI meanwhile).
+    Missing IOS handles (stock SOCKInit failed) and the ncd handle: try an own open at most once a second, each result logged. */
+ /* the Wii's stored network config through ncd ioctlv 3 (NCDGetIfConfig: 0x1B5C bytes of config + 0x20 status, the call Nintendont's loader makes for its Network Profile option).
+@@ -936,6 +960,9 @@
+ 				r->result = 0;
+ 				if (mres >= 0 && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5])) {
+ 					{ u32 t = vg_now_ms(NULL); memcpy(vgIfMacFirst, m, 6); vgIfMacT1 = t ? t : 1u;
++#if VBBA_MACPUB
++					vg_mac_publish(m, vgCfgKind);
++#endif
+ 					dbgprintf("VBBA: mac (ip/top) %02X:%02X:%02X:%02X:%02X:%02X at %u ms (ncd config kind %u: %s)\r\n", m[0], m[1], m[2], m[3], m[4], m[5], t, vgCfgKind, vgCfgKind == 2 ? "wired" : vgCfgKind == 1 ? "wireless" : "unknown"); }
+ 					if (V && memcmp(m, V->chip.mac, 6) != 0) {
+ 						vbba_chip_set_mac(&V->chip, m);     /* before the guest's first reset the guest reads it; after, the next adapter init (Reconnect) does */
+@@ -1443,6 +1470,9 @@
+ 	char *name;
+ 	vgHeap = heap_create(VG_HEAP_PTR, VBBA_HEAP_SIZE);
+ 	if (vgHeap < 0) { dbgprintf("VBBA: heap_create failed\r\n"); return; }
++#if VBBA_MACPUB
++	vg_mac_pub_init();
++#endif
+ 	V = (struct vg *)heap_alloc_aligned(vgHeap, sizeof(struct vg), 32);
+ 	slots = (struct vg_slot *)heap_alloc_aligned(vgHeap, sizeof(struct vg_slot) * VBBA_SLOTS, 32);
+ 	vgQueueHeap = (u8 *)heap_alloc_aligned(vgHeap, 4 * (VBBA_SLOTS + VBBA_QSLACK), 32);

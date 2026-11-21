@@ -1,0 +1,115 @@
+# Multishine patch 0018-multishine-os-thread-dump-irqpoke.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/EXI.c b/kernel/EXI.c
+index 4d5dd09..1ec2bec 100644
+--- a/kernel/EXI.c
++++ b/kernel/EXI.c
+@@ -196,6 +196,17 @@ void EXIInterrupt(void)
+ 	IRQ_Cause[2] = 0;
+ }
+ 
++/* experiment (/vbba.cfg irqpoke=N): one spurious transfer-complete interrupt for slot 0 through the normal delivery path, only when nobody holds the EXI lock */
++void EXIPoke(u32 cause)
++{
++	if (!EXILockTry())
++		return;
++	IRQ_Cause[0] = cause;
++	EXI_IRQ = true;
++	IRQ_Timer = read32(HW_TIMER);
++	EXIUnlock();
++}
++
+ void EXIShutdown(void)
+ {
+ 	VBBAShutdown();	// Multishine: stop the vBBA thread before the card images are written
+diff --git a/kernel/EXI.h b/kernel/EXI.h
+index b00e00f..5e38088 100644
+--- a/kernel/EXI.h
++++ b/kernel/EXI.h
+@@ -81,6 +81,7 @@ u32 EXIDiagCount( void );
+ void EXIDiagEvent( u32 back, u32 now, char *out );
+ void EXIDiagState( u32 *o );
+ int EXILockTry( void );
++void EXIPoke( u32 cause );
+ void EXIUnlock( void );
+ void EXIReadFontFile(u8* Data, u32 Length);
+ void EXIPrepareTRIGameStart();
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index 392c21f..938c5f4 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -332,6 +332,7 @@ static volatile u32 vgNoStart = (VBBA_OFF) & 64;
+ /* ARM duty cycle and its knobs (/vbba.cfg, see vg_read_cfg) */
+ static u32 vgAutoWrite, vgCfgState, vgCfgDuty, vgAutoInfo, vgBaked = 0xFFFFFFFFu;                /* what VBBAConfigLoad found (copied into the status block when the vBBA starts) */
+ static u32 vgSpinTicks = VBBA_SPIN_TICKS, vgIdleUs = VBBA_IDLE_US, vgPrio = VBBA_THREAD_PRIO, vgAdaptive = 0, vgMainUs = VBBA_MAIN_US;
++static u32 vgCfgPoke, vgPokeAt, vgPokes;      /* experiment switch /vbba.cfg irqpoke=SECONDS (0 = off, default): when the guest has posted no EXI command for N s, throw one spurious EXI transfer-complete interrupt (every 5 s at most): tests the lost-interrupt theory */
+ static u32 vgCfgNetDelayS, vgCfgNoBba;   /* test switches from /vbba.cfg: netdelay=SECONDS (net start not before N s after the vBBA started), nobba=1 (the vBBA is never started); both 0 = the behaviour */
+ static u32 dcSleep, dcSleepWant, dcServe, dcBg, dcLoops, dcSpin, dcSleeps, dcT0;
+ static u32 vgSleptAt;
+@@ -1358,6 +1359,7 @@ void VBBAConfigLoad(void)
+ 		else if (!strncmp(tok, "dns=", 4)) { u32 v = vg_ip4(tok + 4, &ok); if (ok) vgDhcpDns = v; }
+ 		else if (!strncmp(tok, "netdelay=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v <= 600u) vgCfgNetDelayS = v; else ok = false; }
+ 		else if (!strncmp(tok, "nobba=", 6)) { u32 v = vg_num(tok + 6, 10, &ok); if (ok) vgCfgNoBba = v ? 1u : 0u; }
++		else if (!strncmp(tok, "irqpoke=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok && v >= 3u && v <= 600u) vgCfgPoke = v; else if (ok && v == 0u) vgCfgPoke = 0; else ok = false; }
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+ 		while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' && buf[i] != ',') i++;
+@@ -1390,6 +1392,7 @@ u32 VBBANoBba(void) { return vgCfgNoBba; }
+ void VBBAConfigLog(void)
+ {
+ 	dbgprintf("VBBA: cfg: netdelay %u s, nobba %u (0 = off, the behaviour)\r\n", vgCfgNetDelayS, vgCfgNoBba);
++	if (vgCfgPoke) dbgprintf("VBBA: cfg: irqpoke %u s (experiment: a spurious EXI TC interrupt after that long a guest silence)\r\n", vgCfgPoke);
+ 	if (VBBA_STEP < 2) return;
+ 	dbgprintf("VBBA: duty %u (baked %d%s, /vbba.cfg %s), spin %u ticks, idle %u us%s, priority %02X, main-loop sleep %u us\r\n", vgCfgDuty, vgBaked <= 5u ? (int)vgBaked : -1,
+ 		(vgAutoInfo & 0xFF) ? ", auto sweep" : "", (vgCfgState & 1) ? "read" : "not found", vgSpinTicks, vgIdleUs, vgAdaptive ? " adaptive" : "", vgPrio, vgMainUs ? vgMainUs : 20u);
+@@ -1793,6 +1796,29 @@ static u32 vg_dg_find_s3(void)
+ 	}
+ 	return 0;
+ }
++
++/* (diagnostic only, reads only): the PowerPC OS thread list.  Interrupts keep running in the frozen runs (the VI retrace counter moves in lumps) but scene_frames stops and the guest posts no more EXI
++   commands, so a game thread is blocked or spinning.  OS globals (Dolphin SDK): 0x800000D4 current OSContext*, 0x800000DC / 0x800000E0 head / tail of the active thread list, 0x800000E4 current OSThread*.
++   OSThread: context 0x000 (r1 at +0x04, lr +0x84, srr0 +0x198, srr1 +0x19C), state u16 +0x2C8 (1 ready, 2 running, 4 waiting, 8 moribund), priority +0x2D0, wait queue +0x2DC, active-list next +0x2FC.
++   A WAITING thread (state 4) with a wait queue is blocked on a lost completion (lr/srr0 name the call site); a RUNNING / READY one with the same srr0 on consecutive samples spins.  The saved context can be stale
++   (a running thread's context is only written at a switch) and PowerPC stores can sit in its data cache, so the same line twice in a row is the useful signal. */
++static u32 vg_pm_ok(u32 a) { return a >= 0x80000000u && a < 0x81800000u && !(a & 3u); }
++static u32 vg_pm_rd(u32 a) { if (!vg_pm_ok(a)) return 0; sync_before_read((void *)((u32)VG_PM(a) & ~31u), 0x20); return *VG_PM(a); }
++static void vg_diag_os(void)
++{
++	u32 cur_ctx, head, curthr, t, n;
++	sync_before_read((void *)VG_PM(0x800000C0u), 0x40);
++	cur_ctx = VG_PM(0x800000D4u)[0]; head = VG_PM(0x800000DCu)[0]; curthr = VG_PM(0x800000E4u)[0];
++	dbgprintf("DIAG: os cur ctx %08X cur thread %08X active list head %08X tail %08X | exi cause words %08X %08X %08X\r\n", cur_ctx, curthr, head, VG_PM(0x800000E0u)[0], vg_pm_rd(0x80000010u), vg_pm_rd(0x80000014u), vg_pm_rd(0x80000018u));
++	for (t = head, n = 0; vg_pm_ok(t) && n < 8u; n++) {
++		u32 st, pr, q, r1, lr, pc, msr;
++		sync_before_read((void *)((u32)VG_PM(t + 0x2C8u) & ~31u), 0x40);
++		st = vg_pm_rd(t + 0x2C8u) >> 16; pr = vg_pm_rd(t + 0x2D0u); q = vg_pm_rd(t + 0x2DCu);
++		r1 = vg_pm_rd(t + 0x04u); lr = vg_pm_rd(t + 0x84u); pc = vg_pm_rd(t + 0x198u); msr = vg_pm_rd(t + 0x19Cu);
++		dbgprintf("DIAG: os thr %u @%08X state %u prio %u waitq %08X | srr0 %08X lr %08X r1 %08X srr1 %08X\r\n", n, t, st, pr, q, pc, lr, r1, msr);
++		t = vg_pm_rd(t + 0x2FCu);
++	}
++}
+ static void vg_diag_ppc(void)
+ {
+ 	extern u32 SI_IRQ;
+@@ -1819,6 +1845,7 @@ static void vg_diag_ppc(void)
+ 	}
+ 	if (vgFirstSelTick && vgLinkTick) dbgprintf("DIAG: time first BBA select %d ms after link-up (%u ms ago)\r\n", (int)((s32)(vgFirstSelTick - vgLinkTick) / 1898), (t - vgFirstSelTick) / 1898u);
+ 	else dbgprintf("DIAG: time first BBA select %s, link-up %s\r\n", vgFirstSelTick ? "seen" : "never", vgLinkTick ? "seen" : "never");
++	vg_diag_os();
+ 	vgDgPrev[0] = calls; vgDgPrev[1] = b0; vgDgPrev[2] = vi; vgDgPrev[3] = sf; vgDgPrevT = t;
+ }
+ /* every 10 s, stall or not (so a stop is visible as a line whose '+' deltas go to 0):
+@@ -1991,6 +2018,7 @@ void VBBAUpdate(void)
+ 			if (idle > 9490000u || sdb > 5694000u) {
+ 				if (!printed || (u32)(t - last_print) > 18980000u) { printed = true; last_print = t; vg_diag_dump(idle / 1898000u, sdb / 1898u); }
+ 			} else printed = false;                 /* the guest talks again: arm the next stall report */
++			if (vgCfgPoke && idle > vgCfgPoke * 1898000u && (u32)(t - vgPokeAt) > 9490000u) { vgPokeAt = t | 1u; vgPokes++; EXIPoke(8u); dbgprintf("VBBA: irqpoke #%u: guest silent %u s, spurious EXI TC interrupt thrown at %u ms\r\n", vgPokes, idle / 1898000u, vg_now_ms(NULL)); }
+ 		}
+ 	}
+ #endif

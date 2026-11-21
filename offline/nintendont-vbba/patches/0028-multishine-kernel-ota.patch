@@ -1,0 +1,34 @@
+# Multishine patch 0028-multishine-kernel-ota.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+--- a/loader/source/main.c
++++ b/loader/source/main.c
+@@ -38,6 +38,7 @@
+ #include "MemCard.h"
+ #include "Patches.h"
+ #include "kernel_zip.h"
++#include "ms_ota_loader.h"   /* Multishine: the kernel OTA (ms_ota_select) */
+ #include "kernelboot_bin.h"
+ #include "multidol_ldr_bin.h"
+ #include "stub_bin.h"
+@@ -688,7 +689,15 @@
+ 	//inject nintendont thread
+ 	void *kernel_bin = NULL;
+ 	unsigned int kernel_bin_size = 0;
+-	unzip_data(kernel_zip, kernel_zip_size, &kernel_bin, &kernel_bin_size);
++	{   /* Multishine OTA: a verified SD:/multishine/kernel.bin (signed with the pinned release keys, not older than the installed one, not rolled back) replaces the embedded kernel;
++	       anything wrong = the embedded one below.  The SD card is mounted and unmounted again inside: the stock mount comes later, after the kernel started. */
++		void *ota_zip = NULL;
++		unsigned int ota_len = 0;
++		ms_ota_select(&ota_zip, &ota_len);
++		if (ota_zip) { unzip_data(ota_zip, ota_len, &kernel_bin, &kernel_bin_size); free(ota_zip); }
++	}
++	if (kernel_bin == NULL)
++		unzip_data(kernel_zip, kernel_zip_size, &kernel_bin, &kernel_bin_size);
+ 	gprintf("Decompressed kernel.bin with %i bytes\r\n", kernel_bin_size);
+ 	memcpy((void*)0x92F00000,kernel_bin,kernel_bin_size);
+ 	DCFlushRange((void*)0x92F00000,kernel_bin_size);

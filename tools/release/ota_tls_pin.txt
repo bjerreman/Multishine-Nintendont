@@ -1,0 +1,7 @@
+# Pin of the update server's TLS key for the Wii shell (offline/nintendont-vbba/ota/ms_tlsget.c): one line "name  64-hex-digit Ed25519 PUBLIC key", at most 4.
+# Empty (only comments) = TLS is OFF in the shell that gets built: it falls back to plain signed HTTP, which is the behaviour of every shell before seq 8.
+# How to fill it (on the update server, as its service user; the key seed stays there, only the PUBLIC key goes into this file):
+#   run the server's TLS tool once to create the key seed (it refuses to overwrite one),
+#   then let it print the public key  (prints:  tls_pin = <64 hex>)
+# then add the line  "update-tls  <64 hex>"  below and rebuild the shell (build_shell.sh).  See.
+update-tls  9933baaefbb0c5e080aec9034f2e2ad2b83f157fb8c1769a8099019c2bc0f09e

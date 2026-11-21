@@ -1,0 +1,103 @@
+# Multishine patch 0029-multishine-wifi-roam-off.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -232,6 +232,7 @@
+ static struct vg *V;
+ static struct vg_slot *slots;
+ static bool vgIfMacTried;
++static bool vgGotIp;                         /* (patch 0029): the guest-visible network address has been seen (roam_off timing) */
+ #ifndef VBBA_WIRED
+ #define VBBA_WIRED 1        /* read the stored network config through ncd (ioctlv 3), log which connection / interface kind IOS will use, ask ip/top for the interface MAC again later (logged with the time); read-only, nothing is written to the Wii's network config */
+ #endif
+@@ -422,6 +423,60 @@
+ 	sync_before_read((void *)a, len);
+ }
+ 
++#ifndef VBBA_ROAM
++#define VBBA_ROAM 1         /* (patch 0029, NIN_MS_ROAM=1): switch the Wi-Fi driver's roaming scan off (WLC iovar roam_off = 1 on /dev/wl0), the design notes section 9; UNTESTED ON A CONSOLE */
++#endif
++#if VBBA_ROAM
++#include "vbba_wl.h"
++/* MAIN THREAD ONLY (blocking IOS calls).  Wireless interface only (ncd config kind 1).  The IOS Wi-Fi driver scans for a better access point about every 10 s (link
++   stops ~150 ms) and turns roaming back on at every (re)association, so: 2 s after the address first appears, then every 10 s, read roam_off and set it when it is 0.
++   Any failure leaves roaming as it is (nothing else is touched); at most 40 failed rounds, then it stops trying. */
++static s32 vgRoamWas = -1, vgRoamRc, vgRoamNow = -1;   /* first round's result for the game.log summary (-1 = not tried) */
++static u32 vgRoamSets;
++static void vg_roam(void)
++{
++	static s32 wlFd = -1;
++	static u32 next, started, fails, sets, kindLogged;
++	u32 now, was;
++	u8 *io;
++	char *name;
++	s32 rc;
++	if (vgGotIp && vgCfgKind != 1 && kindLogged != vgCfgKind + 1u) { kindLogged = vgCfgKind + 1u; dbgprintf("VBBA: roam: skipped, interface kind %u (1 = Wi-Fi, 2 = wired, 0 = unknown)\r\n", vgCfgKind); }
++	if (!vgGotIp || vgCfgKind != 1 || vgHeap < 0 || fails >= 40) return;
++	now = vg_now_ms(NULL);
++	if (!started) { started = 1; next = now + 2000u; return; }
++	if ((s32)(now - next) < 0) return;
++	next = now + 10000u;
++	io = (u8 *)heap_alloc_aligned(vgHeap, VBBA_WL_IO_SIZE, 32);
++	if (!io) { fails++; return; }
++	if (wlFd < 0) {
++		name = (char *)heap_alloc_aligned(vgHeap, 32, 32);
++		if (name) { strcpy(name, VBBA_WL_PATH); wlFd = IOS_Open(name, 0); dbgprintf("VBBA: roam: open of wl0: %d\r\n", wlFd); heap_free(vgHeap, name); }
++		if (wlFd < 0) { fails += 10; heap_free(vgHeap, io); return; }
++	}
++	vbba_wl_build(io, (u32)io & 0x3FFFFFFFu, VBBA_WLC_GET_VAR, "roam_off", 0);
++	sync_after_write(io, VBBA_WL_IO_SIZE);
++	rc = IOS_Ioctl(wlFd, VBBA_WL_IOCTL_WLC, io, VBBA_WL_IO_SIZE, NULL, 0);
++	sync_before_read(io, VBBA_WL_IO_SIZE);
++	was = vbba_wl_value(io);
++	if (rc < 0) { fails++; if (vgRoamWas < 0) vgRoamRc = rc; dbgprintf("VBBA: roam: read roam_off failed: %d\r\n", rc); heap_free(vgHeap, io); return; }
++	if (!was) {
++		vbba_wl_build(io, (u32)io & 0x3FFFFFFFu, VBBA_WLC_SET_VAR, "roam_off", 1);
++		sync_after_write(io, VBBA_WL_IO_SIZE);
++		rc = IOS_Ioctl(wlFd, VBBA_WL_IOCTL_WLC, io, VBBA_WL_IO_SIZE, NULL, 0);
++		vbba_wl_build(io, (u32)io & 0x3FFFFFFFu, VBBA_WLC_GET_VAR, "roam_off", 0);
++		sync_after_write(io, VBBA_WL_IO_SIZE);
++		IOS_Ioctl(wlFd, VBBA_WL_IOCTL_WLC, io, VBBA_WL_IO_SIZE, NULL, 0);
++		sync_before_read(io, VBBA_WL_IO_SIZE);
++		sets++;
++		if (vgRoamWas < 0) { vgRoamWas = 0; vgRoamRc = rc; vgRoamNow = vbba_wl_value(io) ? 1 : 0; }
++		vgRoamSets++;
++		dbgprintf("VBBA: roam: was on, set off rc %d, now %s, %u set(s) so far\r\n", rc, vbba_wl_value(io) ? "OFF" : "still ON", vgRoamSets);
++	} else if (!sets) { if (vgRoamWas < 0) { vgRoamWas = 1; vgRoamRc = 0; vgRoamNow = 1; } dbgprintf("VBBA: roam: was off, set off rc 0 (nothing to set: roaming already off)\r\n"); sets = 1; }
++	heap_free(vgHeap, io);
++}
++#endif
++
+ #if VBBA_MACPUB   /* */
+ static void vg_mac_pub_init(void)
+ {
+@@ -934,12 +989,14 @@
+ 			if (s->stage == 0) {
+ 				r->ip = s->params[8];
+ 				vg_ev_change(ST_GETIF, (u32)r->result, r->ip);
++				if (r->ip) vgGotIp = true;
+ 				if (VG_ON(4) && r->ip && !(vst->kd_flags & 8)) { vst->ip_ms = tnow; vst->kd_flags |= 8; }
+ 				s->stage = 1;                       /* chain SO_GETHOSTID: the result of the ioctl is the address */
+ 				s->msg.seek.origin = (int)(s - slots);
+ 				if (vg_post(s, VG_JOB_HOSTID) >= 0) continue;
+ 			} else if (s->stage == 1) {
+ 				if ((u32)r->result < 0xFFFF0000u && !r->ip) r->ip = (u32)r->result;      /* 192.x.x.x is negative as an s32; errors are small negatives */
++				if (r->ip) vgGotIp = true;
+ 				if (VG_ON(4) && r->ip && !(vst->kd_flags & 8)) { vst->ip_ms = tnow; vst->kd_flags |= 8; }
+ 				vg_ev_change(ST_HOSTID, (u32)r->result, (u32)r->result < 0xFFFF0000u ? (u32)r->result : 0);
+ 				r->result = 0;
+@@ -2167,6 +2224,9 @@
+ 	}
+ 	MS_ST(MSS_VREOPEN);
+ 	vg_reopen();                                        /* missing handles / ncd: blocking opens belong here, not on the fast thread */
++#if VBBA_ROAM
++	vg_roam();
++#endif
+ #if VBBA_WIRED && !VBBA_QUIET
+ 	vg_ifmac_again();                                   /* second and third ip/top MAC answers, logged only */
+ #endif

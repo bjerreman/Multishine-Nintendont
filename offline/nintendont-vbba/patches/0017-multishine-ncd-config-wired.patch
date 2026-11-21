@@ -1,0 +1,120 @@
+# Multishine patch 0017-multishine-ncd-config-wired.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index 901f64a..392c21f 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -227,6 +227,12 @@ static u32 vgIoSends, vgIoFallback;                                   /* sendtos
+ static struct vg *V;
+ static struct vg_slot *slots;
+ static bool vgIfMacTried;
++#ifndef VBBA_WIRED
++#define VBBA_WIRED 1        /* read the stored network config through ncd (ioctlv 3), log which connection / interface kind IOS will use, ask ip/top for the interface MAC again later (logged with the time); read-only, nothing is written to the Wii's network config */
++#endif
++static u32 vgCfgKind;                        /* header byte 4 of the ncd config after the read: 1 wireless, 2 wired, 0 unknown */
++static u32 vgIfMacT1, vgIfMacTries;           /* time (ms) of the first ip/top MAC answer, and how many later main-thread queries were made */
++static u8 vgIfMacFirst[6];
+ #ifndef VBBA_DIAG
+ #define VBBA_DIAG 1         /* guest-stall diagnostics printed by the main thread (DIAG lines, see vg_diag_dump) */
+ #endif
+@@ -397,6 +403,65 @@ static void vg_inval(void *p, u32 n)
+ 
+ /* MAIN THREAD ONLY (IOS_Open is a blocking IPC call: it must never run on the fast EXI thread, nobody else serves EXI meanwhile).
+    Missing IOS handles (stock SOCKInit failed) and the ncd handle: try an own open at most once a second, each result logged. */
++/* the Wii's stored network config through ncd ioctlv 3 (NCDGetIfConfig: 0x1B5C bytes of config + 0x20 status, the call Nintendont's loader makes for its Network Profile option).
++   Layout (wiibrew config.dat): byte 4 = interface kind IOS brings up (1 wireless, 2 wired LAN adapter), 3 connection entries of 0x91C from offset 8; entry byte 0 = flags:
++   0x80 selected, 0x20 internet test passed, 0x04 DNS from DHCP, 0x02 IP from DHCP, 0x01 interface of that entry (1 wired, 0 wireless).  Only flags are logged, never SSIDs, keys or addresses. */
++static void vg_ncd_cfg(void)
++{
++	enum { CFG_LEN = 0x1B5C, CFG_ST = 0x1B60, CFG_TOT = 0x1B80, CFG_ENT = 0x91C, CFG_HDR = 8 };
++	ioctlv *cv;
++	u8 *cb;
++	s32 rc;
++	u32 k;
++	if (ncdFd < 0) { dbgprintf("VBBA: ncd config: no ncd handle\r\n"); return; }
++	cv = (ioctlv *)heap_alloc_aligned(vgHeap, sizeof(ioctlv) * 2, 32);
++	cb = (u8 *)heap_alloc_aligned(vgHeap, CFG_TOT, 32);
++	if (!cv || !cb) { dbgprintf("VBBA: ncd config: out of memory\r\n"); if (cv) heap_free(vgHeap, cv); if (cb) heap_free(vgHeap, cb); return; }
++	memset(cb, 0, CFG_TOT);
++	cv[0].data = cb; cv[0].len = CFG_LEN; cv[1].data = cb + CFG_ST; cv[1].len = 0x20;
++	sync_after_write(cb, CFG_TOT); sync_after_write(cv, sizeof(ioctlv) * 2);
++	rc = IOS_Ioctlv(ncdFd, 3, 0, 2, cv);
++	sync_before_read(cb, CFG_TOT);
++	if (rc < 0 || *(u32 *)(cb + CFG_ST)) { dbgprintf("VBBA: ncd config read failed (rc %d, status %u)\r\n", rc, *(u32 *)(cb + CFG_ST)); heap_free(vgHeap, cb); heap_free(vgHeap, cv); return; }
++	vgCfgKind = cb[4];
++	dbgprintf("VBBA: ncd config: interface kind %u (1 wireless, 2 wired), link timeout %us, header flag %u\r\n", (u32)cb[4], (u32)cb[6], (u32)cb[5]);
++	for (k = 0; k < 3; k++) {
++		u8 f = cb[CFG_HDR + k * CFG_ENT];
++		dbgprintf("VBBA: ncd config: connection %u flags %02X: %s, %s, ip %s, dns %s, internet test %s\r\n", k + 1, (u32)f, (f & 0x80) ? "SELECTED" : "not selected", (f & 1) ? "wired" : "wireless",
++			(f & 2) ? "dhcp" : "manual", (f & 4) ? "dhcp" : "manual", (f & 0x20) ? "passed" : "not passed");
++	}
++	heap_free(vgHeap, cb); heap_free(vgHeap, cv);
++}
++
++/* ask ip/top for the active interface's MAC again from the MAIN thread (blocking, read-only), a few seconds after the first (address-up) answer, and log every answer
++   with its time.  The lanmac test build showed the wired adapter's MAC; here the first answer was the Wi-Fi MAC, so this shows whether the answer depends on when it is asked.
++   Never changes the chip MAC after the first answer (UDP safety): it only logs. */
++static void vg_ifmac_again(void)
++{
++	static const u32 at_ms[2] = { 5000u, 30000u };
++	u32 ms, *p;
++	ioctlv *cv;
++	s32 rc;
++	u8 *m;
++	if (!vgIfMacT1 || vgIfMacTries >= 2u || ipFd < 0 || vgHeap < 0) return;
++	ms = vg_now_ms(NULL);
++	if ((u32)(ms - vgIfMacT1) < at_ms[vgIfMacTries]) return;
++	vgIfMacTries++;
++	cv = (ioctlv *)heap_alloc_aligned(vgHeap, sizeof(ioctlv) * 3, 32);
++	p = (u32 *)heap_alloc_aligned(vgHeap, 32, 32);
++	if (!cv || !p) { dbgprintf("VBBA: mac (ip/top) retry %u: out of memory\r\n", vgIfMacTries); if (cv) heap_free(vgHeap, cv); if (p) heap_free(vgHeap, p); return; }
++	memset(p, 0, 32); memset(cv, 0, sizeof(ioctlv) * 3);
++	p[0] = 0xFFFE; p[1] = 0x1004; p[4] = 6;
++	cv[0].data = &p[0]; cv[0].len = 8; cv[1].data = &p[2]; cv[1].len = 6; cv[2].data = &p[4]; cv[2].len = 4;
++	sync_after_write(p, 32); sync_after_write(cv, sizeof(ioctlv) * 3);
++	rc = IOS_Ioctlv(ipFd, 0x1C, 1, 2, cv);
++	sync_before_read(p, 32);
++	m = (u8 *)&p[2];
++	if (rc >= 0) dbgprintf("VBBA: mac (ip/top) retry %u at %u ms (+%u ms after the first answer): %02X:%02X:%02X:%02X:%02X:%02X (%s the first answer)\r\n", vgIfMacTries, ms, ms - vgIfMacT1, m[0], m[1], m[2], m[3], m[4], m[5], memcmp(m, vgIfMacFirst, 6) ? "differs from" : "same as");
++	else dbgprintf("VBBA: mac (ip/top) retry %u at %u ms failed (rc %d)\r\n", vgIfMacTries, ms, rc);
++	heap_free(vgHeap, p); heap_free(vgHeap, cv);
++}
++
+ static void vg_reopen(void)
+ {
+ 	static u32 last_tick, ncd_tries;
+@@ -854,7 +919,8 @@ static int vg_poll(void *ctx, struct vbba_ios_req **done)
+ 				s32 mres = r->result;
+ 				r->result = 0;
+ 				if (mres >= 0 && (m[0] | m[1] | m[2] | m[3] | m[4] | m[5])) {
+-					dbgprintf("VBBA: mac (ip/top) %02X:%02X:%02X:%02X:%02X:%02X\r\n", m[0], m[1], m[2], m[3], m[4], m[5]);
++					{ u32 t = vg_now_ms(NULL); memcpy(vgIfMacFirst, m, 6); vgIfMacT1 = t ? t : 1u;
++					dbgprintf("VBBA: mac (ip/top) %02X:%02X:%02X:%02X:%02X:%02X at %u ms (ncd config kind %u: %s)\r\n", m[0], m[1], m[2], m[3], m[4], m[5], t, vgCfgKind, vgCfgKind == 2 ? "wired" : vgCfgKind == 1 ? "wireless" : "unknown"); }
+ 					if (V && memcmp(m, V->chip.mac, 6) != 0) {
+ 						vbba_chip_set_mac(&V->chip, m);     /* before the guest's first reset the guest reads it; after, the next adapter init (Reconnect) does */
+ 						dbgprintf("VBBA: chip MAC now %02X:%02X:%02X:%02X:%02X:%02X (guest has%s read the old one)\r\n", m[0], m[1], m[2], m[3], m[4], m[5], V->chip.guest_reset ? "" : " not");
+@@ -1395,6 +1461,9 @@ static void vg_start(void)
+ 	} else dbgprintf("VBBA: mac read: no ncd handle; placeholder 00:09:BF:12:34:56\r\n");
+ #else
+ 	dbgprintf("VBBA: mac read compiled out (VBBA_MAC_READ 0); placeholder 00:09:BF:12:34:56\r\n");
++#endif
++#if VBBA_WIRED
++	vg_ncd_cfg();
+ #endif
+ 	if (ipFd < 0 || kdFd < 0 || vgQueue < 0) dbgprintf("VBBA: IOS handles missing (ip %d kd %d queue %d); no network yet, the chip still answers; will retry\r\n", ipFd, kdFd, vgQueue);
+ 
+@@ -1961,6 +2030,9 @@ void VBBAUpdate(void)
+ 	}
+ 	MS_ST(MSS_VREOPEN);
+ 	vg_reopen();                                        /* missing handles / ncd: blocking opens belong here, not on the fast thread */
++#if VBBA_WIRED
++	vg_ifmac_again();                                   /* second and third ip/top MAC answers, logged only */
++#endif
+ 	MS_ST(MSS_VBBA);
+ #if VBBA_LIVE_LOG
+ 	vg_drain();                                         /* start-up trace lines, printed here (main thread) */

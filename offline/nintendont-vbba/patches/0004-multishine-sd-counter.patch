@@ -1,0 +1,23 @@
+# Multishine patch 0004-multishine-sd-counter.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/SDI.c keeps its BSD-style notice; our changes in them are GPL-2.0-only like the rest.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/SDI.c b/kernel/SDI.c
+index fa89619..bf8a609 100644
+--- a/kernel/SDI.c
++++ b/kernel/SDI.c
+@@ -52,8 +52,10 @@ static u8 *rw_buffer;
+  
+ static char _sd0_fs[] = "/dev/sdio/slot0";
+ 
++vu32 vbbaSdOps;	/* Multishine: SD command counter, the vBBA releases its network start-up when the SD has been idle for a while */
+ static s32 __sdio_sendcommand(u32 cmd,u32 cmd_type,u32 rsp_type,u32 arg,u32 blk_cnt,u32 blk_size,void *buffer,void *reply,u32 rlen)
+ {
++	vbbaSdOps++;
+ 	struct _sdiomsg msg ALIGNED(32);
+ 	s32 ret;
+ 

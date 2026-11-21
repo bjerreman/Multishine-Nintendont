@@ -1,0 +1,1024 @@
+# Multishine patch 0015-multishine-stall-watch.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# Files under other notices that this patch touches: kernel/vsprintf.c (Linus Torvalds, GPL-2.0) keeps its notice; our changes in them are GPL-2.0-only like the rest.
+# New files created by this patch (kernel/vbba_stall.h) are Multishine's own code written against Nintendont's kernel/loader
+# internals; they are GPL-2.0-only (the licence the larger ones state in their notice; the small headers carry this patch's licence).
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/main.c b/kernel/main.c
+index 5f7c824..cbb6854 100644
+--- a/kernel/main.c
++++ b/kernel/main.c
+@@ -33,6 +33,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ #include "EXI.h"
+ #include "sock.h"
+ #include "vbba_glue.h"
++#include "vbba_stall.h"   /* stall breadcrumbs */
+ #include "GCNCard.h"
+ #include "debug.h"
+ #include "GCAM.h"
+@@ -337,6 +338,7 @@ int _main( int argc, char *argv[] )
+ 
+ 	while (1)
+ 	{
++		MS_ST(MSS_TOP);
+ 		_ahbMemFlush(0);
+ #ifdef PERFMON
+ 		loopCnt++;
+@@ -373,6 +375,7 @@ int _main( int argc, char *argv[] )
+ 		}
+ 		if(DI_IRQ == true)
+ 		{
++			MS_ST(MSS_DI);
+ 			if(DiscCheckAsync())
+ 				DIInterrupt();
+ 			else if(!bbaEmuWanted)
+@@ -383,6 +386,7 @@ int _main( int argc, char *argv[] )
+ 			if(TimerDiffSeconds(Now) > 2) /* after 3 second earliest */
+ 			{
+ 				VBBAHoldBegin(); /* Multishine vBBA: its thread stops serving EXI while the card image is written */
++				MS_ST(MSS_SAVE);
+ 				GCNCard_Save();
+ 				VBBAHoldEnd();
+ 				SaveCard = false;
+@@ -399,6 +403,7 @@ int _main( int argc, char *argv[] )
+ 		}
+ 		else /* No device I/O so make sure this stays updated */
+ 			GetCurrentTime();
++		MS_ST(MSS_WAIT);
+ 		udelay(VBBAMainDelay(20)); //wait for other threads (Multishine: /vbba.cfg main=US stretches this while the vBBA runs)
+ 
+ 		if( WaitForRealDisc == 1 )
+@@ -446,9 +451,14 @@ int _main( int argc, char *argv[] )
+ 		DIUpdateRegisters();
+ 		#ifdef PATCHALL
+ 		if(vbbaWanted)
++		{
++			MS_ST(MSS_VBBA);
+ 			VBBAUpdate(); /* starts the vBBA thread once; from then on it owns EXI service */
++		}
+ 		// Multishine: the main loop always serves EXI, serialised with the vBBA thread by the EXI lock
++		MS_ST(MSS_EXI);
+ 		(void)EXIServiceStep();
++		MS_ST(MSS_PADS);
+ 		GCAMUpdateRegisters();
+ 		BTUpdateRegisters();
+ 		HIDUpdateRegisters(0);
+@@ -456,9 +466,11 @@ int _main( int argc, char *argv[] )
+ 		#endif
+ 		if(bbaEmuWanted)
+ 		{
++			MS_ST(MSS_SOCK);
+ 			SOCKUpdateRegisters();
+ 			udelay(200);
+ 		}
++		MS_ST(MSS_MISC);
+ 		StreamUpdateRegisters();
+ 		CheckOSReport();
+ 		if(GCNCard_CheckChanges())
+@@ -466,6 +478,7 @@ int _main( int argc, char *argv[] )
+ 			Now = read32(HW_TIMER);
+ 			SaveCard = true;
+ 		}
++		MS_ST(MSS_RESET);
+ 		sync_before_read((void*)RESET_STATUS, 0x20);
+ 		vu32 reset_status = read32(RESET_STATUS);
+ 		if (reset_status == 0x1DEA)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+index 938e329..a52f67f 100644
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -40,6 +40,7 @@ Nothing here has run on a Wii.  The timing constants below are guesses.
+ #include "EXI.h"
+ #include "ff_utf8.h"
+ #include "vbba_glue.h"
++#include "vbba_stall.h"   /* stall breadcrumbs, watchdog thread, slot LED */
+ 
+ vu32 vbbaWanted = 0;
+ vu32 vbbaActive = 0;
+@@ -1079,6 +1080,42 @@ static void vg_sleep(u32 us)
+ 	else { vgSleepConsec = 0; vgSleptAt = read32(HW_TIMER); }
+ }
+ 
++/* the stall watchdog.  Its own IOS thread (it does not depend on the main loop): every 200 ms it looks at the main loop's breadcrumb (MS_ST in main.c and
++   dbgprintf).  Slot LED: slow blink = the main loop keeps moving; fast blink (5 Hz) = stuck 3 s or more outside FatFs (a STALL line goes to /ndebug.log, at most
++   one per 5 s, never while a disc read is running); solid on = stuck inside FatFs / on the SD card (no log line is possible then; the next 10 s line after it frees
++   up reports the longest stall); the LED frozen = the ARM side as a whole stopped. */
++static u32 *vgWdStack; static u32 vgWdThread;
++static u32 VBBAWdThread(void *arg)
++{
++	u32 lastn = 0, lastchg = read32(HW_TIMER), logged = 0, led = 0, beat = 0, shortSleeps = 0;
++	(void)arg;
++	while (1) {
++		u32 t0 = read32(HW_TIMER), now, n, st, age, mode;
++		udelay(200000);
++		now = read32(HW_TIMER); n = msCrumb.n; st = msCrumb.stage; beat++;
++		if ((u32)(now - t0) < 38000u) {                      /* udelay returned early (no queue or timer): do not spin above the main loop */
++			if (++shortSleeps >= 8u) { shortSleeps = 0; thread_set_priority(vgWdThread, 0x40); }
++		} else shortSleeps = 0;
++		msCrumb.wdbeat = beat;
++		if (n != lastn) { lastn = n; lastchg = now; logged = 0; }
++		age = (u32)(now - lastchg) / 1898u;
++		if (age >= 3000u) {
++			mode = ms_stall_mode(age, st);
++			msCrumb.curms = age; msCrumb.curstage = st;
++			if (age > msCrumb.maxms) { msCrumb.maxms = age; msCrumb.maxstage = st; }
++			if (!DI_IRQ && ms_stall_log_due(mode, age, logged)) {
++				logged = age;
++				msCrumb.wd = 1;
++				dbgprintf("STALL: main loop stuck %u ms at stage %u (entries %u, vBBA main_beat %u, sd ops %u, hold %u, started %u)\r\n", age, st, n, vst ? vst->main_beat : 0u, vbbaSdOps, (u32)vgHold, (u32)vgStarted);
++				msCrumb.wd = 0;
++			}
++		} else { mode = 0; if (msCrumb.curms) { msCrumb.curms = 0; } }
++		if (mode == 2u) set32(HW_GPIO_OUT, GPIO_SLOT_LED);
++		else if (mode == 1u || (beat & 1u) == 0) { led ^= 1u; if (led) set32(HW_GPIO_OUT, GPIO_SLOT_LED); else clear32(HW_GPIO_OUT, GPIO_SLOT_LED); }
++	}
++	return 0;
++}
++
+ static u32 VBBAThread(void *arg)
+ {
+ 	u32 now = read32(HW_TIMER), last_cmd = now, last_bg = now, burst = now, last_poll = now, nbg = 0;
+@@ -1300,6 +1337,7 @@ static void vg_start(void)
+ 	vgDoneStack = (u32 *)heap_alloc_aligned(vgHeap, 0x400, 32);
+ 	vgNetQueueHeap = (u8 *)heap_alloc_aligned(vgHeap, 4 * (VBBA_SLOTS + VBBA_QSLACK), 32);
+ 	vgNetStack = (u32 *)heap_alloc_aligned(vgHeap, VBBA_NET_STACK, 32);
++	vgWdStack = (u32 *)heap_alloc_aligned(vgHeap, 0x1000, 32);   /* */
+ #if VBBA_SYNCTX
+ 	vgTxQueueHeap = (u8 *)heap_alloc_aligned(vgHeap, 4 * (VBBA_SLOTS + VBBA_QSLACK), 32);
+ 	vgTxStack = (u32 *)heap_alloc_aligned(vgHeap, 0x400, 32);
+@@ -1374,6 +1412,11 @@ static void vg_start(void)
+ 	thread_continue(vgDoneThread);
+ 	vgNetThread = thread_create(VBBANetThread, NULL, vgNetStack + VBBA_NET_STACK / sizeof(u32), VBBA_NET_STACK / sizeof(u32), VBBA_NET_PRIO, 1);
+ 	thread_continue(vgNetThread);
++	if (vgWdStack) {   /* */
++		vgWdThread = thread_create(VBBAWdThread, NULL, vgWdStack + 0x1000 / sizeof(u32), 0x1000 / sizeof(u32), 0x78, 1);
++		thread_continue(vgWdThread);
++		dbgprintf("VBBA: stall watchdog started (slot LED: slow blink ok, fast blink main loop stuck, solid on stuck in FatFs/SD)\r\n");
++	} else dbgprintf("VBBA: no memory for the stall watchdog\r\n");
+ #if VBBA_SYNCTX
+ 	vgTxThread = thread_create(VBBASendThread, NULL, vgTxStack + 0x400 / sizeof(u32), 0x400 / sizeof(u32), 0x78, 1);
+ 	thread_continue(vgTxThread);
+@@ -1767,7 +1810,8 @@ extern u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* kernel/vsprintf.c */
+ static void vg_diag_10s(u32 t)
+ {
+ 	static u32 logok;
+-	dbgprintf("LOGOK %u errs %u open_err %u bytes %u\r\n", ++logok, dbgLogErrs, dbgLogOpenErr, dbgLogBytes);   /* a run that ends abruptly has its last LOGOK; a stale file has none */
++	dbgprintf("LOGOK %u errs %u open_err %u bytes %u\r\n", ++logok, dbgLogErrs, dbgLogOpenErr, dbgLogBytes);
++	dbgprintf("STALLMAX: longest %u ms at stage %u, now stage %u age %u ms, watchdog beats %u, entries %u\r\n", msCrumb.maxms, msCrumb.maxstage, msCrumb.stage, (u32)(read32(HW_TIMER) - msCrumb.t) / 1898u, msCrumb.wdbeat, msCrumb.n);   /* */   /* a run that ends abruptly has its last LOGOK; a stale file has none */
+ 	static u32 pt, pS[4][3], pB[4], pBl, pVi, pSf, pHook, pEv[VGR_N], pBbaD; static bool init;
+ 	u32 c, d, ms = pt ? (t - pt) / 1898u : 0, s3 = vg_dg_find_s3(), hook = 0, vi, sf, bba = 0, bbad, ev[VGR_N], evd;
+ 	sync_before_read((void *)VG_PM(0x804D7420u), 0x20);
+@@ -1905,7 +1949,9 @@ void VBBAUpdate(void)
+ 		else if (ms >= (u32)VBBA_NET_CAP_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: cap reached at %u ms (SD ops %u)\r\n", ms, ops); }
+ 		else if (ms >= (u32)VBBA_NET_MIN_S * 1000u && (u32)(ms - last_chg) >= (u32)VBBA_NET_IDLE_S * 1000u) { vgNetReleased = true; dbgprintf("VBBA: net start released: SD idle for %u s at %u ms (SD ops %u)\r\n", (u32)VBBA_NET_IDLE_S, ms, ops); }
+ 	}
++	MS_ST(MSS_VREOPEN);
+ 	vg_reopen();                                        /* missing handles / ncd: blocking opens belong here, not on the fast thread */
++	MS_ST(MSS_VBBA);
+ #if VBBA_LIVE_LOG
+ 	vg_drain();                                         /* start-up trace lines, printed here (main thread) */
+ #endif
+@@ -1915,6 +1961,7 @@ void VBBAUpdate(void)
+ 	/* b17b: the timeline lines every VBBA_TL_PERIOD_S seconds, so they reach /ndebug.log even when the shutdown block never comes.
+ 	   One line per main-loop pass (each dbgprintf is one SD write + sync), never while a disc read may be in FatFs (DI_IRQ, the
+ 	   same rule as GCNCard_Save; FatFs is not reentrant) or during a card-save hold.  The main-loop gap counter skips our own writes. */
++	MS_ST(MSS_VTL);
+ 	if (!vgTlInit) { vgTlInit = true; vgTlTick = now; }
+ 	{ u32 d = (u32)(now - vgTlTick) / 1898u; vgTlTick += d * 1898u; vgTlMs += d; }     /* whole ms (HW_TIMER 1.898 MHz) */
+ 	if (vgTlK >= VG_TL_LINES && vgTlMs >= vgTlNext) { vgTlK = 0; vgNetLn = 0; vgTlNext = vgTlMs + VBBA_TL_PERIOD_MS; vgTlAt = vgTlMs / 1000u; }
+diff --git a/kernel/vbba_stall.h b/kernel/vbba_stall.h
+new file mode 100644
+index 0000000..9052fa2
+--- /dev/null
++++ b/kernel/vbba_stall.h
+@@ -0,0 +1,40 @@
++/* stall breadcrumbs.  The main loop and dbgprintf note the stage they are in (a number and the HW_TIMER at entry); a watchdog
++   thread (vbba_glue.c) reads them every 200 ms, drives the slot LED (slow blink healthy, fast blink main loop stalled outside FatFs,
++   solid on stalled inside FatFs/SD, frozen LED = the whole ARM side stopped) and keeps the longest stall per stage for the 10 s line. */
++#ifndef VBBA_STALL_H
++#define VBBA_STALL_H
++#ifndef MS_STALL_HOST
++#include "global.h"
++#endif
++#define MSS_TOP 1
++#define MSS_DI 2          /* FatFs: ISO read (DiscCheckAsync / DIInterrupt) */
++#define MSS_SAVE 3        /* FatFs: GCNCard_Save */
++#define MSS_USB 4
++#define MSS_WAIT 5        /* the main loop's udelay */
++#define MSS_VBBA 6        /* VBBAUpdate, first part */
++#define MSS_VREOPEN 7     /* vg_reopen: blocking IOS opens */
++#define MSS_VTL 8         /* timeline lines (dbgprintf) */
++#define MSS_EXI 9
++#define MSS_PADS 10       /* GCAM / BT / HID / SI */
++#define MSS_SOCK 11
++#define MSS_MISC 12       /* Stream, OSReport, card change check */
++#define MSS_RESET 13
++#define MSS_LOG_OPEN 20   /* FatFs */
++#define MSS_LOG_WRITE 21  /* FatFs */
++#define MSS_LOG_SYNC 22   /* FatFs */
++#define MSS_IS_FAT(s) ((s) == MSS_DI || (s) == MSS_SAVE || ((s) >= MSS_LOG_OPEN && (s) <= MSS_LOG_SYNC))
++struct ms_crumb {
++	volatile u32 stage, t, n;       /* current stage, HW_TIMER at its entry, entries counted */
++	volatile u32 wd;                /* 1 while the watchdog thread is inside its own dbgprintf (the crumbs are then left alone) */
++	volatile u32 maxms, maxstage;   /* longest stall seen by the watchdog, and where */
++	volatile u32 wdbeat;            /* watchdog loop counter (200 ms each) */
++	volatile u32 curms, curstage;   /* the stall in progress (0 = none) */
++};
++extern struct ms_crumb msCrumb;
++/* the watchdog's decision (pure, host tested in tests/stall_watch_test.c): 0 = moving, 1 = stuck 3 s or more outside FatFs, 2 = stuck 3 s or more inside FatFs */
++#define MSS_STALL_MS 3000u
++static inline u32 ms_stall_mode(u32 age_ms, u32 stage) { return age_ms < MSS_STALL_MS ? 0u : (MSS_IS_FAT(stage) ? 2u : 1u); }
++/* a STALL line is due at the first check of a stall and then every 5 s, at most 12 lines (logged = the age at the previous line, 0 = none yet) */
++static inline u32 ms_stall_log_due(u32 mode, u32 age_ms, u32 logged) { return mode == 1u && (!logged || age_ms >= logged + 5000u) && logged < 60000u; }
++#define MS_ST(s) do { if (!msCrumb.wd) { msCrumb.stage = (s); msCrumb.t = read32(HW_TIMER); msCrumb.n++; } } while (0)
++#endif
+diff --git a/kernel/vsprintf.c b/kernel/vsprintf.c
+index add2b9d..ba3f437 100644
+--- a/kernel/vsprintf.c
++++ b/kernel/vsprintf.c
+@@ -1,387 +1,394 @@
+-/*
+- *  linux/lib/vsprintf.c
+- *
+- *  Copyright (C) 1991, 1992  Linus Torvalds
+- */
+-
+-/* vsprintf.c -- Lars Wirzenius & Linus Torvalds. */
+-/*
+- * Wirzenius wrote this portably, Torvalds fucked it up :-)
+- */
+-
+-#include "vsprintf.h"
+-#include "Config.h"
+-#include "ff_utf8.h"
+-#include "vbba_build_id.h"   /* VBBA_BUILD_ID, the loader tag id of this build (written by build_wii.sh) */
+-#ifdef NIN_SPECIAL_VERSION
+-#define NIN_SPECIAL_VERSION_TXT NIN_SPECIAL_VERSION
+-#else
+-#define NIN_SPECIAL_VERSION_TXT ""
+-#endif
+-
+-static FIL dbgfile;
+-static int file_opened = -1;
+-u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* write errors, bytes written, last open error + 1 (0 = none); read by the vBBA glue for the LOGOK lines */
+-static u32 dbgTrunc;
+-static int dbgFirstOpen = 1;                   /* the first open of a run truncates the file (FA_CREATE_ALWAYS), later re-opens append */
+-vu32 SDisInit=0;
+-
+-extern int svc_write(char *buffer);
+-
+-static inline int isdigit(int c)
+-{
+-	return c >= '0' && c <= '9';
+-}
+-
+-static inline int isxdigit(int c)
+-{
+-	return (c >= '0' && c <= '9')
+-	    || (c >= 'a' && c <= 'f')
+-	    || (c >= 'A' && c <= 'F');
+-}
+-
+-static inline int islower(int c)
+-{
+-	return c >= 'a' && c <= 'z';
+-}
+-
+-static inline int toupper(int c)
+-{
+-	if (islower(c))
+-		c -= 'a'-'A';
+-	return c;
+-}
+-
+-static int skip_atoi(const char **s)
+-{
+-	int i=0;
+-
+-	while (isdigit(**s))
+-		i = i*10 + *((*s)++) - '0';
+-	return i;
+-}
+-
+-#define ZEROPAD	1		/* pad with zero */
+-#define SIGN	2		/* unsigned/signed long */
+-#define PLUS	4		/* show plus */
+-#define SPACE	8		/* space if plus */
+-#define LEFT	16		/* left justified */
+-#define SPECIAL	32		/* 0x */
+-#define LARGE	64		/* use 'ABCDEF' instead of 'abcdef' */
+-
+-#define do_div(n,base) ({ \
+-int __res; \
+-__res = ((unsigned long) n) % (unsigned) base; \
+-n = ((unsigned long) n) / (unsigned) base; \
+-__res; })
+-
+-static char * number(char * str, long num, int base, int size, int precision
+-	,int type)
+-{
+-	char c,sign,tmp[66];
+-	const char *digits="0123456789abcdefghijklmnopqrstuvwxyz";
+-	int i;
+-
+-	if (type & LARGE)
+-		digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+-	if (type & LEFT)
+-		type &= ~ZEROPAD;
+-	if (base < 2 || base > 36)
+-		return 0;
+-	c = (type & ZEROPAD) ? '0' : ' ';
+-	sign = 0;
+-	if (type & SIGN) {
+-		if (num < 0) {
+-			sign = '-';
+-			num = -num;
+-			size--;
+-		} else if (type & PLUS) {
+-			sign = '+';
+-			size--;
+-		} else if (type & SPACE) {
+-			sign = ' ';
+-			size--;
+-		}
+-	}
+-	if (type & SPECIAL) {
+-		if (base == 16)
+-			size -= 2;
+-		else if (base == 8)
+-			size--;
+-	}
+-	i = 0;
+-	if (num == 0)
+-		tmp[i++]='0';
+-	else while (num != 0)
+-		tmp[i++] = digits[do_div(num,base)];
+-	if (i > precision)
+-		precision = i;
+-	size -= precision;
+-	if (!(type&(ZEROPAD+LEFT)))
+-		while(size-->0)
+-			*str++ = ' ';
+-	if (sign)
+-		*str++ = sign;
+-	if (type & SPECIAL) {
+-		if (base==8)
+-			*str++ = '0';
+-		else if (base==16) {
+-			*str++ = '0';
+-			*str++ = digits[33];
+-		}
+-	}
+-	if (!(type & LEFT))
+-		while (size-- > 0)
+-			*str++ = c;
+-	while (i < precision--)
+-		*str++ = '0';
+-	while (i-- > 0)
+-		*str++ = tmp[i];
+-	while (size-- > 0)
+-		*str++ = ' ';
+-	return str;
+-}
+-
+-int _vsprintf(char *buf, const char *fmt, va_list args)
+-{
+-	int len;
+-	unsigned long num;
+-	int i, base;
+-	char * str;
+-	const char *s;
+-
+-	int flags;		/* flags to number() */
+-
+-	int field_width;	/* width of output field */
+-	int precision;		/* min. # of digits for integers; max
+-				   number of chars for from string */
+-	int qualifier;		/* 'h', 'l', or 'L' for integer fields */
+-
+-	for (str=buf ; *fmt ; ++fmt) {
+-		if (*fmt != '%') {
+-			*str++ = *fmt;
+-			continue;
+-		}
+-
+-		/* process flags */
+-		flags = 0;
+-		repeat:
+-			++fmt;		/* this also skips first '%' */
+-			switch (*fmt) {
+-				case '-': flags |= LEFT; goto repeat;
+-				case '+': flags |= PLUS; goto repeat;
+-				case ' ': flags |= SPACE; goto repeat;
+-				case '#': flags |= SPECIAL; goto repeat;
+-				case '0': flags |= ZEROPAD; goto repeat;
+-				}
+-
+-		/* get field width */
+-		field_width = -1;
+-		if (isdigit(*fmt))
+-			field_width = skip_atoi(&fmt);
+-		else if (*fmt == '*') {
+-			++fmt;
+-			/* it's the next argument */
+-			field_width = va_arg(args, int);
+-			if (field_width < 0) {
+-				field_width = -field_width;
+-				flags |= LEFT;
+-			}
+-		}
+-
+-		/* get the precision */
+-		precision = -1;
+-		if (*fmt == '.') {
+-			++fmt;
+-			if (isdigit(*fmt))
+-				precision = skip_atoi(&fmt);
+-			else if (*fmt == '*') {
+-				++fmt;
+-				/* it's the next argument */
+-				precision = va_arg(args, int);
+-			}
+-			if (precision < 0)
+-				precision = 0;
+-		}
+-
+-		/* get the conversion qualifier */
+-		qualifier = -1;
+-		if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L') {
+-			qualifier = *fmt;
+-			++fmt;
+-		}
+-
+-		/* default base */
+-		base = 10;
+-
+-		switch (*fmt) {
+-		case 'c':
+-			if (!(flags & LEFT))
+-				while (--field_width > 0)
+-					*str++ = ' ';
+-			*str++ = (unsigned char) va_arg(args, int);
+-			while (--field_width > 0)
+-				*str++ = ' ';
+-			continue;
+-
+-		case 's':
+-			s = va_arg(args, char *);
+-			//if (!s)
+-			//	s = "<NULL>";
+-
+-			len = strnlen(s, precision);
+-
+-			if (!(flags & LEFT))
+-				while (len < field_width--)
+-					*str++ = ' ';
+-			for (i = 0; i < len; ++i)
+-				*str++ = *s++;
+-			while (len < field_width--)
+-				*str++ = ' ';
+-			continue;
+-
+-		case 'p':
+-			if (field_width == -1) {
+-				field_width = 2*sizeof(void *);
+-				flags |= ZEROPAD;
+-			}
+-			str = number(str,
+-				(unsigned long) va_arg(args, void *), 16,
+-				field_width, precision, flags);
+-			continue;
+-
+-
+-		case 'n':
+-			if (qualifier == 'l') {
+-				long * ip = va_arg(args, long *);
+-				*ip = (str - buf);
+-			} else {
+-				int * ip = va_arg(args, int *);
+-				*ip = (str - buf);
+-			}
+-			continue;
+-
+-		case '%':
+-			*str++ = '%';
+-			continue;
+-
+-		/* integer number formats - set up the flags and "break" */
+-		case 'o':
+-			base = 8;
+-			break;
+-
+-		case 'X':
+-			flags |= LARGE;
+-		case 'x':
+-			base = 16;
+-			break;
+-
+-		case 'd':
+-		case 'i':
+-			flags |= SIGN;
+-		case 'u':
+-			break;
+-
+-		default:
+-			*str++ = '%';
+-			if (*fmt)
+-				*str++ = *fmt;
+-			else
+-				--fmt;
+-			continue;
+-		}
+-		if (qualifier == 'l')
+-			num = va_arg(args, unsigned long);
+-		else if (qualifier == 'h') {
+-			num = (unsigned short) va_arg(args, int);
+-			if (flags & SIGN)
+-				num = (short) num;
+-		} else if (flags & SIGN)
+-			num = va_arg(args, int);
+-		else
+-			num = va_arg(args, unsigned int);
+-		str = number(str, num, base, field_width, precision, flags);
+-	}
+-	*str = '\0';
+-	return str-buf;
+-}
+-
+-int dbgprintf( const char *fmt, ...)
+-{
+-	va_list args;
+-
+-	if ( (*(vu32*)(0xd800070) & 1) == 0)
+-		return -1;
+-	
+-	//char *buffer = (char*)heap_alloc_aligned( 0, 2048, 32 );	
+-	char buffer[0x100]; //get from stack
+-
+-	va_start(args, fmt);
+-	_vsprintf(buffer, fmt, args);
+-	va_end(args);
+-
+-	u32 read;	
+-	if( SDisInit )
+-	{
+-		if(file_opened != FR_OK)	//if log not open yet
+-		{
+-			sync_before_read((void*)0x12FFFFC0, 0x40);
+-			dbgTrunc = (read32(0x12FFFFD4) == 0x4C475052u && read32(0x12FFFFDC) == 1u) ? 1u : 0u;   /* the loader moved the previous log (or there was none) */
+-			file_opened = f_open_char(&dbgfile, "/ndebug.log", ((dbgFirstOpen && dbgTrunc) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)|FA_WRITE);
+-			if (file_opened == FR_OK) dbgFirstOpen = 0; else dbgLogOpenErr = (u32)file_opened + 1u;
+-
+-			if (file_opened == FR_OK)	//new log opened write header
+-			{
+-				u32 v = read32(0x3140);
+-				dbgprintf("RUNID: log %s, sd probe open %d write %d close %d flush %d | previous log stat %d unlink %d rename %d existed %d\r\n", dbgTrunc ? "truncated" : "appended",
+-					(int)(read32(0x12FFFFD8) & 0xFF), (int)((read32(0x12FFFFD8) >> 8) & 0xFF), (int)((read32(0x12FFFFD8) >> 16) & 0xFF), (int)(read32(0x12FFFFD8) >> 24),
+-					(int)(read32(0x12FFFFE0) & 0xFF), (int)((read32(0x12FFFFE0) >> 8) & 0xFF), (int)((read32(0x12FFFFE0) >> 16) & 0xFF), (int)(read32(0x12FFFFE0) >> 31));
+-				dbgprintf("RUNID: loader tag %s%s ticks %u\r\n", VBBA_BUILD_ID, NIN_SPECIAL_VERSION_TXT, read32(0x0d800010));   /* the first line of every run */
+-				dbgprintf("Nintendont IOS%d v%d.%d\r\n", v >> 16, (v >> 8) & 0xff, v & 0xff);
+-
+-				dbgprintf("Built   : %s %s\r\n", __DATE__, __TIME__ );
+-				dbgprintf("Version : %d.%d\r\n", NIN_VERSION>>16, NIN_VERSION&0xFFFF );
+-			}
+-		}
+-			
+-		if (file_opened == FR_OK) {
+-			f_lseek(&dbgfile, dbgfile.obj.objsize);
+-			if (f_write(&dbgfile, buffer, strlen(buffer), &read) != FR_OK || read != strlen(buffer)) dbgLogErrs++; else dbgLogBytes += read;
+-			if (f_sync(&dbgfile) != FR_OK) dbgLogErrs++;
+-		}
+-	}
+-
+-	if( !IsWiiU() ) // usbgecko?
+-		svc_write(buffer);
+-
+-	//heap_free( 0, buffer );
+-
+-	return 0;
+-}
+-void closeLog(void)
+-{
+-	if(file_opened == FR_OK)
+-	{
+-		file_opened = -1;
+-		f_close(&dbgfile);
+-	}
+-}
+-void CheckOSReport(void)
+-{
+-	sync_before_read((void*)0x13160000, 0x8);
+-
+-	u32 Length = read32(0x13160004);
+-	if (Length != 0x0)
+-	{
+-		char* Address = (char*)(P2C(read32(0x13160000)));
+-		sync_before_read((void*)((u32)(Address) & 0x1FFFFFFC), Length + 4);
+-		char* Msg = malloca(Length + 1, 0x20);
+-		strncpy(Msg, Address, Length);
+-		Msg[Length] = '\0';
+-		dbgprintf(Msg);
+-		free(Msg);
+-		write32(0x13160004, 0);
+-		sync_after_write((void*)0x13160004, 0x4);
+-	}
+-	return;
+-}
++/*
++ *  linux/lib/vsprintf.c
++ *
++ *  Copyright (C) 1991, 1992  Linus Torvalds
++ */
++
++/* vsprintf.c -- Lars Wirzenius & Linus Torvalds. */
++/*
++ * Wirzenius wrote this portably, Torvalds fucked it up :-)
++ */
++
++#include "vsprintf.h"
++#include "Config.h"
++#include "ff_utf8.h"
++#include "vbba_stall.h"   /* stall breadcrumbs */
++#include "vbba_build_id.h"   /* VBBA_BUILD_ID, the loader tag id of this build (written by build_wii.sh) */
++#ifdef NIN_SPECIAL_VERSION
++#define NIN_SPECIAL_VERSION_TXT NIN_SPECIAL_VERSION
++#else
++#define NIN_SPECIAL_VERSION_TXT ""
++#endif
++
++struct ms_crumb msCrumb;   /* */
++static FIL dbgfile;
++static int file_opened = -1;
++u32 dbgLogErrs, dbgLogBytes, dbgLogOpenErr;   /* write errors, bytes written, last open error + 1 (0 = none); read by the vBBA glue for the LOGOK lines */
++static u32 dbgTrunc;
++static int dbgFirstOpen = 1;                   /* the first open of a run truncates the file (FA_CREATE_ALWAYS), later re-opens append */
++vu32 SDisInit=0;
++
++extern int svc_write(char *buffer);
++
++static inline int isdigit(int c)
++{
++	return c >= '0' && c <= '9';
++}
++
++static inline int isxdigit(int c)
++{
++	return (c >= '0' && c <= '9')
++	    || (c >= 'a' && c <= 'f')
++	    || (c >= 'A' && c <= 'F');
++}
++
++static inline int islower(int c)
++{
++	return c >= 'a' && c <= 'z';
++}
++
++static inline int toupper(int c)
++{
++	if (islower(c))
++		c -= 'a'-'A';
++	return c;
++}
++
++static int skip_atoi(const char **s)
++{
++	int i=0;
++
++	while (isdigit(**s))
++		i = i*10 + *((*s)++) - '0';
++	return i;
++}
++
++#define ZEROPAD	1		/* pad with zero */
++#define SIGN	2		/* unsigned/signed long */
++#define PLUS	4		/* show plus */
++#define SPACE	8		/* space if plus */
++#define LEFT	16		/* left justified */
++#define SPECIAL	32		/* 0x */
++#define LARGE	64		/* use 'ABCDEF' instead of 'abcdef' */
++
++#define do_div(n,base) ({ \
++int __res; \
++__res = ((unsigned long) n) % (unsigned) base; \
++n = ((unsigned long) n) / (unsigned) base; \
++__res; })
++
++static char * number(char * str, long num, int base, int size, int precision
++	,int type)
++{
++	char c,sign,tmp[66];
++	const char *digits="0123456789abcdefghijklmnopqrstuvwxyz";
++	int i;
++
++	if (type & LARGE)
++		digits = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
++	if (type & LEFT)
++		type &= ~ZEROPAD;
++	if (base < 2 || base > 36)
++		return 0;
++	c = (type & ZEROPAD) ? '0' : ' ';
++	sign = 0;
++	if (type & SIGN) {
++		if (num < 0) {
++			sign = '-';
++			num = -num;
++			size--;
++		} else if (type & PLUS) {
++			sign = '+';
++			size--;
++		} else if (type & SPACE) {
++			sign = ' ';
++			size--;
++		}
++	}
++	if (type & SPECIAL) {
++		if (base == 16)
++			size -= 2;
++		else if (base == 8)
++			size--;
++	}
++	i = 0;
++	if (num == 0)
++		tmp[i++]='0';
++	else while (num != 0)
++		tmp[i++] = digits[do_div(num,base)];
++	if (i > precision)
++		precision = i;
++	size -= precision;
++	if (!(type&(ZEROPAD+LEFT)))
++		while(size-->0)
++			*str++ = ' ';
++	if (sign)
++		*str++ = sign;
++	if (type & SPECIAL) {
++		if (base==8)
++			*str++ = '0';
++		else if (base==16) {
++			*str++ = '0';
++			*str++ = digits[33];
++		}
++	}
++	if (!(type & LEFT))
++		while (size-- > 0)
++			*str++ = c;
++	while (i < precision--)
++		*str++ = '0';
++	while (i-- > 0)
++		*str++ = tmp[i];
++	while (size-- > 0)
++		*str++ = ' ';
++	return str;
++}
++
++int _vsprintf(char *buf, const char *fmt, va_list args)
++{
++	int len;
++	unsigned long num;
++	int i, base;
++	char * str;
++	const char *s;
++
++	int flags;		/* flags to number() */
++
++	int field_width;	/* width of output field */
++	int precision;		/* min. # of digits for integers; max
++				   number of chars for from string */
++	int qualifier;		/* 'h', 'l', or 'L' for integer fields */
++
++	for (str=buf ; *fmt ; ++fmt) {
++		if (*fmt != '%') {
++			*str++ = *fmt;
++			continue;
++		}
++
++		/* process flags */
++		flags = 0;
++		repeat:
++			++fmt;		/* this also skips first '%' */
++			switch (*fmt) {
++				case '-': flags |= LEFT; goto repeat;
++				case '+': flags |= PLUS; goto repeat;
++				case ' ': flags |= SPACE; goto repeat;
++				case '#': flags |= SPECIAL; goto repeat;
++				case '0': flags |= ZEROPAD; goto repeat;
++				}
++
++		/* get field width */
++		field_width = -1;
++		if (isdigit(*fmt))
++			field_width = skip_atoi(&fmt);
++		else if (*fmt == '*') {
++			++fmt;
++			/* it's the next argument */
++			field_width = va_arg(args, int);
++			if (field_width < 0) {
++				field_width = -field_width;
++				flags |= LEFT;
++			}
++		}
++
++		/* get the precision */
++		precision = -1;
++		if (*fmt == '.') {
++			++fmt;
++			if (isdigit(*fmt))
++				precision = skip_atoi(&fmt);
++			else if (*fmt == '*') {
++				++fmt;
++				/* it's the next argument */
++				precision = va_arg(args, int);
++			}
++			if (precision < 0)
++				precision = 0;
++		}
++
++		/* get the conversion qualifier */
++		qualifier = -1;
++		if (*fmt == 'h' || *fmt == 'l' || *fmt == 'L') {
++			qualifier = *fmt;
++			++fmt;
++		}
++
++		/* default base */
++		base = 10;
++
++		switch (*fmt) {
++		case 'c':
++			if (!(flags & LEFT))
++				while (--field_width > 0)
++					*str++ = ' ';
++			*str++ = (unsigned char) va_arg(args, int);
++			while (--field_width > 0)
++				*str++ = ' ';
++			continue;
++
++		case 's':
++			s = va_arg(args, char *);
++			//if (!s)
++			//	s = "<NULL>";
++
++			len = strnlen(s, precision);
++
++			if (!(flags & LEFT))
++				while (len < field_width--)
++					*str++ = ' ';
++			for (i = 0; i < len; ++i)
++				*str++ = *s++;
++			while (len < field_width--)
++				*str++ = ' ';
++			continue;
++
++		case 'p':
++			if (field_width == -1) {
++				field_width = 2*sizeof(void *);
++				flags |= ZEROPAD;
++			}
++			str = number(str,
++				(unsigned long) va_arg(args, void *), 16,
++				field_width, precision, flags);
++			continue;
++
++
++		case 'n':
++			if (qualifier == 'l') {
++				long * ip = va_arg(args, long *);
++				*ip = (str - buf);
++			} else {
++				int * ip = va_arg(args, int *);
++				*ip = (str - buf);
++			}
++			continue;
++
++		case '%':
++			*str++ = '%';
++			continue;
++
++		/* integer number formats - set up the flags and "break" */
++		case 'o':
++			base = 8;
++			break;
++
++		case 'X':
++			flags |= LARGE;
++		case 'x':
++			base = 16;
++			break;
++
++		case 'd':
++		case 'i':
++			flags |= SIGN;
++		case 'u':
++			break;
++
++		default:
++			*str++ = '%';
++			if (*fmt)
++				*str++ = *fmt;
++			else
++				--fmt;
++			continue;
++		}
++		if (qualifier == 'l')
++			num = va_arg(args, unsigned long);
++		else if (qualifier == 'h') {
++			num = (unsigned short) va_arg(args, int);
++			if (flags & SIGN)
++				num = (short) num;
++		} else if (flags & SIGN)
++			num = va_arg(args, int);
++		else
++			num = va_arg(args, unsigned int);
++		str = number(str, num, base, field_width, precision, flags);
++	}
++	*str = '\0';
++	return str-buf;
++}
++
++int dbgprintf( const char *fmt, ...)
++{
++	va_list args;
++
++	if ( (*(vu32*)(0xd800070) & 1) == 0)
++		return -1;
++	
++	//char *buffer = (char*)heap_alloc_aligned( 0, 2048, 32 );	
++	char buffer[0x100]; //get from stack
++
++	va_start(args, fmt);
++	_vsprintf(buffer, fmt, args);
++	va_end(args);
++
++	u32 read;	
++	u32 msSaved = msCrumb.stage;   /* */
++	if( SDisInit )
++	{
++		if(file_opened != FR_OK)	//if log not open yet
++		{
++			MS_ST(MSS_LOG_OPEN);
++			sync_before_read((void*)0x12FFFFC0, 0x40);
++			dbgTrunc = (read32(0x12FFFFD4) == 0x4C475052u && read32(0x12FFFFDC) == 1u) ? 1u : 0u;   /* the loader moved the previous log (or there was none) */
++			file_opened = f_open_char(&dbgfile, "/ndebug.log", ((dbgFirstOpen && dbgTrunc) ? FA_CREATE_ALWAYS : FA_OPEN_ALWAYS)|FA_WRITE);
++			if (file_opened == FR_OK) dbgFirstOpen = 0; else dbgLogOpenErr = (u32)file_opened + 1u;
++
++			if (file_opened == FR_OK)	//new log opened write header
++			{
++				u32 v = read32(0x3140);
++				dbgprintf("RUNID: log %s, sd probe open %d write %d close %d flush %d | previous log stat %d unlink %d rename %d existed %d\r\n", dbgTrunc ? "truncated" : "appended",
++					(int)(read32(0x12FFFFD8) & 0xFF), (int)((read32(0x12FFFFD8) >> 8) & 0xFF), (int)((read32(0x12FFFFD8) >> 16) & 0xFF), (int)(read32(0x12FFFFD8) >> 24),
++					(int)(read32(0x12FFFFE0) & 0xFF), (int)((read32(0x12FFFFE0) >> 8) & 0xFF), (int)((read32(0x12FFFFE0) >> 16) & 0xFF), (int)(read32(0x12FFFFE0) >> 31));
++				dbgprintf("RUNID: loader tag %s%s ticks %u\r\n", VBBA_BUILD_ID, NIN_SPECIAL_VERSION_TXT, read32(0x0d800010));   /* the first line of every run */
++				dbgprintf("Nintendont IOS%d v%d.%d\r\n", v >> 16, (v >> 8) & 0xff, v & 0xff);
++
++				dbgprintf("Built   : %s %s\r\n", __DATE__, __TIME__ );
++				dbgprintf("Version : %d.%d\r\n", NIN_VERSION>>16, NIN_VERSION&0xFFFF );
++			}
++		}
++			
++		if (file_opened == FR_OK) {
++			MS_ST(MSS_LOG_WRITE);
++			f_lseek(&dbgfile, dbgfile.obj.objsize);
++			if (f_write(&dbgfile, buffer, strlen(buffer), &read) != FR_OK || read != strlen(buffer)) dbgLogErrs++; else dbgLogBytes += read;
++			MS_ST(MSS_LOG_SYNC);
++			if (f_sync(&dbgfile) != FR_OK) dbgLogErrs++;
++		}
++		MS_ST(msSaved ? msSaved : MSS_TOP);   /* back to the caller's stage (a fresh timestamp: the log write finished) */
++	}
++
++	if( !IsWiiU() ) // usbgecko?
++		svc_write(buffer);
++
++	//heap_free( 0, buffer );
++
++	return 0;
++}
++void closeLog(void)
++{
++	if(file_opened == FR_OK)
++	{
++		file_opened = -1;
++		f_close(&dbgfile);
++	}
++}
++void CheckOSReport(void)
++{
++	sync_before_read((void*)0x13160000, 0x8);
++
++	u32 Length = read32(0x13160004);
++	if (Length != 0x0)
++	{
++		char* Address = (char*)(P2C(read32(0x13160000)));
++		sync_before_read((void*)((u32)(Address) & 0x1FFFFFFC), Length + 4);
++		char* Msg = malloca(Length + 1, 0x20);
++		strncpy(Msg, Address, Length);
++		Msg[Length] = '\0';
++		dbgprintf(Msg);
++		free(Msg);
++		write32(0x13160004, 0);
++		sync_after_write((void*)0x13160004, 0x4);
++	}
++	return;
++}

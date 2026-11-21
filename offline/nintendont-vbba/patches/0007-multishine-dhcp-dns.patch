@@ -1,0 +1,81 @@
+# Multishine patch 0007-multishine-dhcp-dns.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff --git a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -1144,6 +1144,26 @@
+ 
+ /* No destination restriction: like a real BBA, any host and port the game or the system-files builder sends UDP to goes out.  Until then only
+    RFC 1918 was allowed, so every datagram to the public server was counted in "denied" and dropped (system-files builder on the Wii never reached the server). */
++#ifndef VBBA_DHCP_DNS
++#define VBBA_DHCP_DNS 0x01010101u   /* the resolver the DHCP ACK/OFFER hands to the guest (option 6): 1.1.1.1.  POLICY KNOB: /vbba.cfg "dns=a.b.c.d" overrides it, "dns=none" sends no option 6 (the behaviour).
++                                       The Wii's own resolver is NOT used: IOS gives it only through ncd/kd calls that the glue does not make (no new IOS call in a test build). */
++#endif
++static u32 vgDhcpDns = VBBA_DHCP_DNS;
++static u32 vg_ip4(const char *p, bool *ok)      /* "a.b.c.d" (each 0..255) or "none" (= 0), followed by a separator */
++{
++	u32 v = 0, i, n, d;
++	*ok = false;
++	if (!strncmp(p, "none", 4)) { *ok = true; return 0; }
++	for (i = 0; i < 4u; i++) {
++		n = 0; d = 0;
++		while (*p >= '0' && *p <= '9' && d < 4u) { n = n * 10u + (u32)(*p - '0'); p++; d++; }
++		if (!d || n > 255u) return 0;
++		v = (v << 8) | n;
++		if (i < 3u) { if (*p != '.') return 0; p++; }
++	}
++	*ok = *p == 0 || *p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',' || *p == '#';
++	return v;
++}
+ static void vg_router_cfg(struct vbba_router_cfg *c)
+ {
+ 	static const u8 router_mac[6] = { 0x02, 0x56, 0x42, 0x42, 0x41, 0x01 };
+@@ -1154,6 +1174,7 @@
+ 	memcpy(c->router_mac, router_mac, 6);
+ 	c->allow[0].ip = 0; c->allow[0].mask = 0; c->allow[0].port_lo = 1; c->allow[0].port_hi = 65535;
+ 	c->nallow = 1;
++	c->dns = vgDhcpDns;                         /* DHCP option 6 */
+ }
+ 
+ 
+@@ -1195,14 +1216,17 @@
+ void VBBAConfigLoad(void)
+ {
+ 	static FIL cf;
+-	if (VBBA_STEP < 2) return;
++	const bool dnsonly = VBBA_STEP < 2;      /* a step-1 build reads only dns= from /vbba.cfg and ignores the rest of it */
+ 	char buf[160];
+ 	u32 rd = 0, i = 0, duty = 0, state = 0, spin_us = 0, idle_us = 0, prio = 0, main_us = 0, hv = 0, baked;
+ 	/* the preset baked into this copy of the app by the project's other tooling: the loader leaves it at 0x92FFFFC8/CC (ARM 0x12FFFFC8/CC); /vbba.cfg overrides it */
+-	sync_before_read((void *)0x12FFFFC0, 0x20);
+-	baked = read32(0x12FFFFC8) == 0x56424455u ? read32(0x12FFFFCC) : 0xFFFFFFFFu;
+-	vgAutoInfo = read32(0x12FFFFC8) == 0x56424455u ? read32(0x12FFFFD0) : 0;                    /* the auto app's sweep position and flags */
+-	if (baked <= 5u) { duty = baked; state |= 4; }
++	baked = 0xFFFFFFFFu;
++	if (!dnsonly) {
++		sync_before_read((void *)0x12FFFFC0, 0x20);
++		baked = read32(0x12FFFFC8) == 0x56424455u ? read32(0x12FFFFCC) : 0xFFFFFFFFu;
++		vgAutoInfo = read32(0x12FFFFC8) == 0x56424455u ? read32(0x12FFFFD0) : 0;                    /* the auto app's sweep position and flags */
++		if (baked <= 5u) { duty = baked; state |= 4; }
++	}
+ 	if (f_open_char(&cf, "/vbba.cfg", FA_OPEN_EXISTING | FA_READ) == FR_OK) {
+ 		if (f_read(&cf, buf, sizeof buf - 1, &rd) != FR_OK) rd = 0;
+ 		f_close(&cf);
+@@ -1222,10 +1246,12 @@
+ 		else if (!strncmp(tok, "idle=", 5)) { idle_us = vg_num(tok + 5, 10, &ok); hv |= ok ? 2u : 0; }
+ 		else if (!strncmp(tok, "prio=", 5)) { prio = vg_num(tok + 5, 16, &ok); hv |= ok ? 4u : 0; }
+ 		else if (!strncmp(tok, "main=", 5)) { main_us = vg_num(tok + 5, 10, &ok); hv |= ok ? 8u : 0; }
++		else if (!strncmp(tok, "dns=", 4)) { u32 v = vg_ip4(tok + 4, &ok); if (ok) vgDhcpDns = v; }
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+ 		while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' && buf[i] != ',') i++;
+ 	}
++	if (dnsonly) return;
+ 	if (duty > 5) { duty = 0; state |= 2; }
+ 	if ((vgAutoInfo & 0x20000) && !(vgAutoInfo & 0x40000) && (vgAutoInfo & 0xFF)) {    /* the loader could not write the sweep state: try from here (the SD log writes work); a failure falls back to d0 */
+ 		char t[8];

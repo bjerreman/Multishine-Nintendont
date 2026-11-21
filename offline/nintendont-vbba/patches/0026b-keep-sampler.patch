@@ -1,0 +1,172 @@
+# Multishine patch 0026b-keep-sampler.patch against FIX94/Nintendont bbc0a208e81d6ab0a828a431dc0b2ba6fc06aec5 (https://github.com/FIX94/Nintendont)
+# SPDX-License-Identifier: GPL-2.0-only
+# This patch changes Nintendont, which is licensed under the GNU General Public License version 2 only; the changes are a
+# derivative work of Nintendont and are licensed GPL-2.0-only. The copyright of the original files stays with their authors
+# (Nintendont: crediar, FIX94 and contributors); their notices are kept unchanged.
+# Changes by Multishine: Copyright (C) 2026 Nigzel / Bjerreman.
+# (git apply ignores these lines: everything before the first diff header.)
+diff -ruN a/kernel/Makefile b/kernel/Makefile
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -46,7 +46,7 @@
+ vpath %.c $(VBBA_DIRS)
+ VBBA_OBJS := vbba_chip.o vbba_router.o vbba_ndexi.o vbba_tp_ios.o
+ OBJECTS	+= $(VBBA_OBJS)
+-VBBA_FLAGS := -std=gnu99 $(if $(VBBA_STEP),-DVBBA_STEP=$(VBBA_STEP)) $(if $(VBBA_OFF),-DVBBA_OFF=$(VBBA_OFF)) -DVBBA_WITH_CORE -I$(MULTISHINE)/offline/nintendont-vbba/core -I$(MULTISHINE)/offline/nintendont-vbba/platform/nintendont
++VBBA_FLAGS := -std=gnu99 $(if $(VBBA_QUIET),-DVBBA_QUIET=1 -DVBBA_DIAG=0) $(if $(VBBA_STEP),-DVBBA_STEP=$(VBBA_STEP)) $(if $(VBBA_OFF),-DVBBA_OFF=$(VBBA_OFF)) -DVBBA_WITH_CORE -I$(MULTISHINE)/offline/nintendont-vbba/core -I$(MULTISHINE)/offline/nintendont-vbba/platform/nintendont
+ $(VBBA_OBJS) vbba_glue.o: CFLAGS += $(VBBA_FLAGS)
+ endif
+ LIBS	:= ../fatfs/libfatfs-arm.a be/libc.a be/libgcc.a
+diff -ruN a/kernel/vbba_glue.c b/kernel/vbba_glue.c
+--- a/kernel/vbba_glue.c
++++ b/kernel/vbba_glue.c
+@@ -237,6 +237,13 @@
+ static u32 vgCfgKind;                        /* header byte 4 of the ncd config after the read: 1 wireless, 2 wired, 0 unknown */
+ static u32 vgIfMacT1, vgIfMacTries;           /* time (ms) of the first ip/top MAC answer, and how many later main-thread queries were made */
+ static u8 vgIfMacFirst[6];
++#ifndef VBBA_QUIET
++#define VBBA_QUIET 0   /* release build (Makefile: -DVBBA_QUIET=1 -DVBBA_DIAG=0): no periodic diagnostics, no stall watchdog, no experiment switches */
++#endif
++#if VBBA_QUIET
++#pragma GCC diagnostic ignored "-Wunused-function"
++#pragma GCC diagnostic ignored "-Wunused-variable"
++#endif
+ #ifndef VBBA_DIAG
+ #define VBBA_DIAG 1         /* guest-stall diagnostics printed by the main thread (DIAG lines, see vg_diag_dump) */
+ #endif
+@@ -292,7 +299,7 @@
+ #define VBBA_OWN_OPEN 1     /* (diagnostic had 0) own IOS_Open of ip/top, kd/request, ncd/manage in vg_reopen (0 = stock SOCKInit handles only, no ncd handle) */
+ #endif
+ #ifndef VBBA_CRUMBS
+-#define VBBA_CRUMBS 1       /* breadcrumb line before and after every blocking IOS call of the vBBA (ndebug.log), so a stall shows which call it died in */
++#define VBBA_CRUMBS (!VBBA_QUIET)       /* breadcrumb line before and after every blocking IOS call of the vBBA (ndebug.log), so a stall shows which call it died in */
+ #endif
+ #if VBBA_CRUMBS
+ #define VG_CRUMB(...) dbgprintf(__VA_ARGS__)
+@@ -1372,6 +1379,7 @@
+ 		else if (!strncmp(tok, "prio=", 5)) { prio = vg_num(tok + 5, 16, &ok); hv |= ok ? 4u : 0; }
+ 		else if (!strncmp(tok, "main=", 5)) { main_us = vg_num(tok + 5, 10, &ok); hv |= ok ? 8u : 0; }
+ 		else if (!strncmp(tok, "dns=", 4)) { u32 v = vg_ip4(tok + 4, &ok); if (ok) vgDhcpDns = v; }
++#if !VBBA_QUIET   /* release build: /vbba.cfg knows dns= only (the experiment switches below are compiled out) */
+ 		else if (!strncmp(tok, "netearly=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v >= 1u && v <= 30u) { vgCfgNetDelayS = v; vgCfgNetEarly = 1; } else ok = false; }
+ 		else if (!strncmp(tok, "netdelay=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && v <= 600u) vgCfgNetDelayS = v; else ok = false; }
+ 		else if (!strncmp(tok, "nobba=", 6)) { u32 v = vg_num(tok + 6, 10, &ok); if (ok) vgCfgNoBba = v ? 1u : 0u; }
+@@ -1380,6 +1388,7 @@
+ 		else if (!strncmp(tok, "irqpoke=", 8)) { u32 v = vg_num(tok + 8, 10, &ok); if (ok && v >= 3u && v <= 600u) vgCfgPoke = v; else if (ok && v == 0u) vgCfgPoke = 0; else ok = false; }
+ 		else if (!strncmp(tok, "gate=", 5)) { u32 v = vg_num(tok + 5, 10, &ok); if (ok && v <= 1u) vgCfgGate = v; else ok = false; }
+ 		else if (!strncmp(tok, "autopoke=", 9)) { u32 v = vg_num(tok + 9, 10, &ok); if (ok && (v == 0u || (v >= 1u && v <= 60u))) vgCfgAuto = v; else ok = false; }
++#endif
+ 		else ok = false;
+ 		if (!ok) state |= 2;
+ 		while (buf[i] && buf[i] != ' ' && buf[i] != '\t' && buf[i] != '\r' && buf[i] != '\n' && buf[i] != ',') i++;
+@@ -1411,11 +1420,15 @@
+ /* the first lines of the run block in /ndebug.log (main.c, right after the "Game path" line; the SD log is on by then): which preset this run uses and why */
+ void VBBAConfigLog(void)
+ {
++#if !VBBA_QUIET
+ 	dbgprintf("VBBA: cfg: %s %u s, nobba %u (0 = off, the behaviour)\r\n", vgCfgNetEarly ? "netearly" : "netdelay", vgCfgNetDelayS, vgCfgNoBba);
+ 	if (vbbaCfgNoSave || vbbaCfgSdProbe) dbgprintf("VBBA: cfg: nosave %u (the memory card is never written to the SD), sdprobe %u (SD sector 0 read once a second, slot LED)\r\n", vbbaCfgNoSave, vbbaCfgSdProbe);
+ 	dbgprintf("VBBA: cfg: autopoke %u s (0 = off), EXI channel table at %08X\r\n", vgCfgAuto, ExiChanTabAddr);
+ 	dbgprintf("VBBA: cfg: gate %u (1 = the default-timing net start waits for the guest's BBA init, 0 = timing)\r\n", vgCfgGate);
+ 	if (vgCfgPoke) dbgprintf("VBBA: cfg: irqpoke %u s (experiment: a spurious EXI TC interrupt after that long a guest silence)\r\n", vgCfgPoke);
++#else
++	dbgprintf("VBBA: net start = the guest BBA init + 3 s, cap %u s\r\n", (u32)VBBA_NET_CAP_S);
++#endif
+ 	if (VBBA_STEP < 2) return;
+ 	dbgprintf("VBBA: duty %u (baked %d%s, /vbba.cfg %s), spin %u ticks, idle %u us%s, priority %02X, main-loop sleep %u us\r\n", vgCfgDuty, vgBaked <= 5u ? (int)vgBaked : -1,
+ 		(vgAutoInfo & 0xFF) ? ", auto sweep" : "", (vgCfgState & 1) ? "read" : "not found", vgSpinTicks, vgIdleUs, vgAdaptive ? " adaptive" : "", vgPrio, vgMainUs ? vgMainUs : 20u);
+@@ -1437,7 +1450,9 @@
+ 	vgDoneStack = (u32 *)heap_alloc_aligned(vgHeap, 0x400, 32);
+ 	vgNetQueueHeap = (u8 *)heap_alloc_aligned(vgHeap, 4 * (VBBA_SLOTS + VBBA_QSLACK), 32);
+ 	vgNetStack = (u32 *)heap_alloc_aligned(vgHeap, VBBA_NET_STACK, 32);
++#if !VBBA_QUIET
+ 	vgWdStack = (u32 *)heap_alloc_aligned(vgHeap, 0x1000, 32);   /* */
++#endif
+ #if VBBA_SYNCTX
+ 	vgTxQueueHeap = (u8 *)heap_alloc_aligned(vgHeap, 4 * (VBBA_SLOTS + VBBA_QSLACK), 32);
+ 	vgTxStack = (u32 *)heap_alloc_aligned(vgHeap, 0x400, 32);
+@@ -1515,11 +1530,13 @@
+ 	thread_continue(vgDoneThread);
+ 	vgNetThread = thread_create(VBBANetThread, NULL, vgNetStack + VBBA_NET_STACK / sizeof(u32), VBBA_NET_STACK / sizeof(u32), VBBA_NET_PRIO, 1);
+ 	thread_continue(vgNetThread);
++#if !VBBA_QUIET
+ 	if (vgWdStack) {   /* */
+ 		vgWdThread = thread_create(VBBAWdThread, NULL, vgWdStack + 0x1000 / sizeof(u32), 0x1000 / sizeof(u32), 0x78, 1);
+ 		thread_continue(vgWdThread);
+ 		dbgprintf("VBBA: stall watchdog started (slot LED: slow blink ok, fast blink main loop stuck, solid on stuck in FatFs/SD)\r\n");
+ 	} else dbgprintf("VBBA: no memory for the stall watchdog\r\n");
++#endif
+ #if VBBA_SYNCTX
+ 	vgTxThread = thread_create(VBBASendThread, NULL, vgTxStack + 0x400 / sizeof(u32), 0x400 / sizeof(u32), 0x78, 1);
+ 	thread_continue(vgTxThread);
+@@ -1548,7 +1565,11 @@
+ 	vgNetT0 = vg_now_ms(NULL);
+ 	if (vgCfgNetDelayS) dbgprintf("VBBA: net start %s until %u s after the vBBA start (/vbba.cfg %s)\r\n", vgCfgNetEarly ? "set to start EARLY, not before" : "deferred", vgCfgNetDelayS, vgCfgNetEarly ? "netearly" : "netdelay");
+ 	else if (VBBA_NET_DELAY_S) dbgprintf("VBBA: net start deferred until %u s\r\n", (u32)VBBA_NET_DELAY_S);
++#if VBBA_QUIET
++	else if (VBBA_NET_ACT) dbgprintf("VBBA: net start deferred until the guest BBA init + 3 s (min %u s, cap %u s)\r\n", (u32)VBBA_NET_MIN_S, (u32)VBBA_NET_CAP_S);
++#else
+ 	else if (VBBA_NET_ACT) dbgprintf("VBBA: net start deferred until the SD is idle for %u s (min %u s, cap %u s)\r\n", (u32)VBBA_NET_IDLE_S, (u32)VBBA_NET_MIN_S, (u32)VBBA_NET_CAP_S);
++#endif
+ 	vbbaActive = 1;
+ 	vgGo = 1;
+ }
+@@ -2010,6 +2031,8 @@
+ 	dbgprintf("DIAG: guest 80479D30=%08X 8046B6A8=%08X 8046B6A0=%08X 8046B6C4=%08X\r\n", VG_DG(0x80479D30u), VG_DG(0x8046B6A8u), VG_DG(0x8046B6A0u), VG_DG(0x8046B6C4u));
+ 	vg_diag_ppc();
+ }
++#else
++void VBBASdProbeTick(void) {}
+ #endif
+ 
+ void VBBAUpdate(void)
+@@ -2103,7 +2126,7 @@
+ 	}
+ 	MS_ST(MSS_VREOPEN);
+ 	vg_reopen();                                        /* missing handles / ncd: blocking opens belong here, not on the fast thread */
+-#if VBBA_WIRED
++#if VBBA_WIRED && !VBBA_QUIET
+ 	vg_ifmac_again();                                   /* second and third ip/top MAC answers, logged only */
+ #endif
+ 	MS_ST(MSS_VBBA);
+@@ -2113,6 +2136,7 @@
+ #if VBBA_SCENESTAT
+ 	vg_sc_track(now);                                   /* b22b: DI_IRQ edges and the card's unsaved state, every pass */
+ #endif
++#if !VBBA_QUIET
+ 	/* b17b: the timeline lines every VBBA_TL_PERIOD_S seconds, so they reach /ndebug.log even when the shutdown block never comes.
+ 	   One line per main-loop pass (each dbgprintf is one SD write + sync), never while a disc read may be in FatFs (DI_IRQ, the
+ 	   same rule as GCNCard_Save; FatFs is not reentrant) or during a card-save hold.  The main-loop gap counter skips our own writes. */
+@@ -2122,6 +2146,7 @@
+ 	if (vgTlK >= VG_TL_LINES && vgTlMs >= vgTlNext) { vgTlK = 0; vgNetLn = 0; vgTlNext = vgTlMs + VBBA_TL_PERIOD_MS; vgTlAt = vgTlMs / 1000u; }
+ 	if (vgTlK < VG_TL_LINES && !DI_IRQ && !vgHold) { vg_tl_line(vgTlK++, vgTlAt); last_tick = read32(HW_TIMER); }
+ 	else if (vgTlK >= VG_TL_LINES && vgNetLn < 2u && !DI_IRQ && !vgHold) { vg_diag_net(vgNetLn++, 1, vgTlAt); last_tick = read32(HW_TIMER); }
++#endif
+ }
+ 
+ void VBBAShutdown(void)
+@@ -2158,13 +2183,16 @@
+ 	thread_cancel(vgDoneThread, 0);
+ 	vg_status_update();
+ 	vg_drain();
++#if !VBBA_QUIET
+ 	dbgprintf("VBBA: watchdog: heartbeat %u main passes %u main gap max %u ms, run max %u ticks, sleep fails %u\r\n",
+ 		vst->heartbeat, vst->main_beat, vst->main_gap_max_ms, vst->run_max_ticks, vst->sleep_fail);
+ 	dbgprintf("VBBA: watchdog: trips %u (reason %u, flags %x), ios timeouts %u, orphans %u\r\n", vst->wd_trips, vst->wd_reason, vst->wd_flags, vst->ios_timeouts, vst->orphans);
+ 	dbgprintf("VBBA: stopped. selects %u imm %u dma %u (%u B) cmds %u\r\n", vst->selects, vst->imm, vst->dma, vst->dma_bytes, vst->cmds);
++#endif
+ 	dbgprintf("VBBA: stopped: tx frames %u rx frames %u udp out %u in %u denied %u | net %u ip %08X startups %u\r\n",
+ 		vst->tx_frames, vst->rx_frames, vst->tx_udp, vst->rx_dgrams, vst->tx_denied, vst->net, vst->ip, vst->startups);
+ 	if (V) dbgprintf("VBBA: guest net: arp requests %u (answered %u, ignored %u), udp to port 53 %u, udp out %u, denied %u, dhcp discover %u ack %u\r\n", V->router.st.arp_req, V->router.st.arp_replies, V->router.st.arp_ignored, V->router.st.tx_dns, V->router.st.tx_udp, V->router.st.tx_denied, V->router.st.dhcp_disc, V->router.st.dhcp_ack);
++#if !VBBA_QUIET
+ 	dbgprintf("VBBA: idle sleeps %u (longest %u ticks for a %u us request; HW_TIMER ticks are 0.527 us), longest poll gap %u ticks\r\n",
+ 		vst->sleeps, vst->sleep_max_ticks, VBBA_IDLE_US, vst->spin_gap_max_ticks);
+ 	dbgprintf("VBBA: holds %u (longest %u ticks), startup rc %08X\r\n", vst->holds, vst->hold_max_ticks, vst->startup_rc);
+@@ -2206,6 +2234,7 @@
+ 		dbgprintf("VBBA: duty: %u loops, %u spin iterations, %u commands; last second awake %u of %u ms, main loop %u passes\r\n",
+ 			vst->dc_loops, vst->dc_spin, vst->cmds, vst->win_wall > vst->win_sleep ? (vst->win_wall - vst->win_sleep) / 1898u : 0, vst->win_wall / 1898u, vst->win_main);
+ 	}
++#endif
+ 	if (ncdFd >= 0) { IOS_Close(ncdFd); ncdFd = -1; }
+ 	if (ipOwn && ipFd >= 0) IOS_Close(ipFd);
+ 	if (kdOwn && kdFd >= 0) IOS_Close(kdFd);
