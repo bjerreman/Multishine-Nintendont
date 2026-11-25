@@ -477,8 +477,38 @@ class DnsSocketArgs(unittest.TestCase):
         ch = open(os.path.join(OTA, "ms_chain.c")).read()
         self.assertIn("(hk && hk->late) ? MSOTA_CHAIN_LATE : 0", ch)
         ld = open(os.path.join(OTA, "ms_ota_loader.c")).read()
-        self.assertIn("{ chain_crumb, chain_shutdown, 0, (KernelLoaded || ms_chain_late()) ? 1 : 0 }", ld)   # LATE only with a running kernel (170: !ota_early, also from ms_ota_select)
+        self.assertIn("{ chain_crumb, chain_shutdown, 0, (KernelLoaded || ms_chain_late()) ? 1 : 0, 0 }", ld)   # LATE only with a running kernel (170: !ota_early, also from ms_ota_select)
         self.assertNotIn("!ota_early }", ld)
+
+    def test_restart_after_a_kernel_install_is_wired_once(self):
+        # a kernel installed while an older kernel runs (a late hand-over start): ONE restart in the early flavour (the new start reloads IOS58 and loads kernel.bin); krn.rst is the loop guard
+        ld = open(os.path.join(OTA, "ms_ota_loader.c")).read()
+        cc = ld[ld.index("static void ota_chain_after_check(void)"):ld.index("/* main()'s very first action")]
+        for piece in ("msota_krestart_decide(&ki)", "restarting to start kernel %lu", "restart for kernel %lu skipped: %s", "hk.late = 0; hk.kreload = 1;", "kernel_stop()"):
+            self.assertIn(piece, cc)
+        self.assertLess(cc.index("write_file(MSOTA_KRST"), cc.index("kernel_stop()"))                  # the guard is on the card before anything is stopped
+        self.assertLess(cc.index("kernel_stop()"), cc.index("ms_chain_run("))
+        self.assertIn("if (kr != MSOTA_KR_GO && !inst_shell_seq) { if (file) free(file); return; }", cc)      # no restart needed: back at once, nothing shown
+        self.assertIn("if (!inst_shell_seq && !prep) return;", cc)                                         # the kernel check runs whenever a kernel runs, not only after this start's own install
+        self.assertIn("read_file(MSOTA_KBIN, &kb, &kn, MSOTA_MAX_FILE)", cc)
+        self.assertIn("ki.active = kst.active", cc)
+        self.assertNotIn("inst_krn_seq", ld)
+        sel = ld[ld.index("void ms_ota_select(void **zip"):ld.index("/* ---- the Update screen")]
+        for piece in ("msota_krestart_after(km, ks)", "kernel %lu already running after restart", "no second restart for it"):
+            self.assertIn(piece, sel)
+        self.assertLess(sel.index("msota_decide(&st"), sel.index("msota_krestart_after"))
+        ch = open(os.path.join(OTA, "ms_chain.c")).read()
+        self.assertIn("(hk->late || hk->kreload)", ch)                                                     # the STM hook is released by this shell, as on a late hand-over
+        self.assertIn("(hk && hk->late) ? MSOTA_CHAIN_LATE : 0", ch)                                       # kreload sends the early flavour (late = 0)
+
+    def test_download_budget_follows_the_announced_size(self):
+        ld = open(os.path.join(OTA, "ms_ota_loader.c")).read()
+        self.assertIn('boot_dl_budget("kernel", size, 12000)', ld)
+        self.assertIn('boot_dl_budget("shell", size, 30000)', ld)
+        self.assertIn("msdl_budget(size, 40000)", ld)
+        self.assertEqual(ld.count("msdl_expired("), 1)                                                      # the plain HTTP fetch; the TLS fetch has its own
+        self.assertIn("msdl_expired(", open(os.path.join(OTA, "ms_tlsget.c")).read())
+        self.assertIn("kept for the plain fallback", ld)
 
     def test_172_the_kernel_probe_decides_and_the_guard_word_is_cleared(self):
         # DSI of (170 -> 171 on Wi-Fi): 170 handed over from ms_ota_select (after the IOS58 reload, BEFORE its kernel load) with the flavour LATE; 171 skipped the kernel load,

@@ -30,7 +30,7 @@ static const char *const MSR_REMOVE[] = {
 /* what stays: the shell and its update state, the kernel and its update state, network caches, and the switches the player or tester made on purpose; reset_backup is the backup itself */
 static const char *const MSR_KEEP[] = {
 	"shell.dol", "shell.bak", "shell.new", "shell.bad", "shl.st", "shl.ok",
-	"kernel.bin", "kernel.bak", "kernel.new", "kernel.bad", "ota.st", "chain.try", "chain.fail",
+	"kernel.bin", "kernel.bak", "kernel.new", "kernel.bad", "ota.st", "chain.try", "chain.fail", "krn.rst",
 	"ota.ip", "tls.seed", "ota_url.txt",
 	"ota_off", "no_drive_probe", "native_si", "no_native_si", "no_inject", "teardown_full", "no_chain", "diag.no", "any_disc", "dns_on", "no_dns", "no_conn_check", "conn_check_on", "conn.txt", "no_card_update", "dev", "verbose", "ui_43", "ui_wide",
 	MSR_BACKUP,

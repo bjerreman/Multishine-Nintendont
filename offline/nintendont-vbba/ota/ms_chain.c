@@ -134,7 +134,7 @@ int ms_chain_run(const u8 *dol, u32 len, int argc, char **argv, const struct ms_
 	/* stop what the shell started, step by step, each with a breadcrumb before and after (the SD is still mounted: a hang leaves the name of the call as the last line of ota.log).  Default set
 	   only (ms_chain_steps.h); hk->full runs every step.  Nothing here may wait for an interrupt or an IOS reply. */
 	for (i = 0; i < MSCH_NSTEPS; i++) {
-		if (msch_steps[i].full_only && !(hk && hk->full) && !(i == MSCH_STM && hk && hk->late)) continue;      /* a LATE hand-over keeps this IOS (no reload): the old shell releases its own STM hook here, while its callback is still valid (the new shell's libogc cannot: it is refused a second hook; releasing it from the NEW shell blacked the screen) */
+		if (msch_steps[i].full_only && !(hk && hk->full) && !(i == MSCH_STM && hk && (hk->late || hk->kreload))) continue;      /* a LATE hand-over keeps this IOS (no reload): the old shell releases its own STM hook here, while its callback is still valid (the new shell's libogc cannot: it is refused a second hook; releasing it from the NEW shell blacked the screen) */
 		CRUMB("teardown: %s ...", msch_steps[i].name);
 #ifndef MS_CHAIN_TEST                      /* the emulator test has no shell around it: no video, GX, audio, ES or STM to stop */
 		switch (i) {

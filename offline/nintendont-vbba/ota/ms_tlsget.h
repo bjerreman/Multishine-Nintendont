@@ -22,7 +22,7 @@ struct mstls_result {
     int tls_err, alert;         /* sdtls_err / alert when the handshake failed */
     sdc_u32 hs_ms;              /* time from the start to the end of the handshake */
 };
-/* GET path from host (also the SNI) within deadline_ms of the call, at most max_body bytes.  MSTLS_OK only for a 200 with a Content-Length body that arrived whole. */
+/* GET path from host (also the SNI) within deadline_ms of the call (a body that is still arriving goes on past it, ms_dlrule.h), at most max_body bytes.  MSTLS_OK only for a 200 with a Content-Length body that arrived whole. */
 int mstls_get(const struct mstls_net *net, const char *host, const char *path, const sdc_u8 *pins, sdc_u32 npins, sdtls_rand_fn rnd, void *rctx,
               sdc_u32 max_body, sdc_u32 deadline_ms, struct mstls_result *res);
 #define MSTLS_POST_MAX 16384u      /* the https site's request body cap */

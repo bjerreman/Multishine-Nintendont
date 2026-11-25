@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "ms_ota_core.h"
+#include "ms_dlrule.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -167,8 +168,111 @@ static void test_restart(void)
     r.reboot_ok = 0; CHECK(msota_restart_decide(&r) == MSOTA_RS_INPLACE);
 }
 
+/* the restart for a newer kernel, one start after another: ota.st as msota_decide and the boot check's install keep it (an install sets active to 0), krn.rst as the loader keeps it
+   (written before the restart, cleared once the new kernel runs), kernel.bin = the seq of the verified file (0 = none) */
+struct kworld { struct msota_state st; mw2_u32 kbin, krst, running; };
+static void kw_install(struct kworld *w, mw2_u32 seq) { w->kbin = seq; w->st.pending = 0; w->st.fail = 0; w->st.active = 0; if (seq > w->st.floor) w->st.floor = seq; }   /* ota_boot_check_body + the swap */
+static void kw_load(struct kworld *w)                                   /* ms_ota_select: msota_decide, the kernel load */
+{
+    int action = 0;
+    int pick = msota_decide(&w->st, w->kbin != 0, w->kbin, 1, &action);
+    if (action == 1) w->kbin = 0;
+    w->running = pick == MSOTA_PICK_DOWNLOADED ? w->kbin : 1000;        /* 1000 = the embedded kernel */
+    if (w->krst && msota_krestart_after(w->krst, pick == MSOTA_PICK_DOWNLOADED ? w->kbin : 0) == MSOTA_KA_RUNS) w->krst = 0;
+}
+static int kw_check(struct kworld *w, int kernel_runs, int dol_ok)       /* ota_chain_after_check with a kernel running (or not) */
+{
+    struct msota_krestart_in in;
+    int d;
+    memset(&in, 0, sizeof in);
+    in.file_seq = w->kbin; in.floor = w->st.floor; in.bad = w->st.bad; in.active = w->st.active; in.marker_seq = w->krst; in.running = kernel_runs; in.dol_ok = dol_ok;
+    d = msota_krestart_decide(&in);
+    if (d == MSOTA_KR_GO) w->krst = w->kbin;
+    return d;
+}
+
+static void test_krestart(void)
+{
+    struct kworld w;
+    int i, restarts = 0;
+    /* an older loader (175..177) runs ; its check installs and in one start, after its kernel was loaded, and hands over late to 178 */
+    memset(&w, 0, sizeof w); w.kbin = 61; kw_load(&w); CHECK(w.running == 61 && w.st.active == 61);
+    kw_install(&w, 62);
+    /* 178 starts late with 61 running; its own check finds nothing new: kernel.bin 62 is newer than the running kernel: ONE restart */
+    CHECK(kw_check(&w, 1, 1) == MSOTA_KR_GO && w.krst == 62); restarts++;
+    /* the restart: the early flavour, the kernel is loaded from kernel.bin: 62 runs, krn.rst cleared; the next late start (a later shell update) sees kernel.bin = the running kernel: no restart */
+    kw_load(&w); CHECK(w.running == 62 && w.st.active == 62 && w.krst == 0);
+    if (kw_check(&w, 1, 1) == MSOTA_KR_GO) restarts++;
+    CHECK(restarts == 1);
+    /* kernel.bin equal to the running kernel (a late start, nothing installed): no restart */
+    CHECK(kw_check(&w, 1, 1) == MSOTA_KR_NONE && w.krst == 0);
+    /* this start's own check installs 63 while 62 runs: one restart, then it runs */
+    kw_install(&w, 63); CHECK(kw_check(&w, 1, 1) == MSOTA_KR_GO && w.krst == 63);
+    kw_load(&w); CHECK(w.running == 63 && w.krst == 0 && kw_check(&w, 1, 1) == MSOTA_KR_NONE);
+    /* a kernel installed before the kernel load (a normal start: no kernel runs yet): no restart, the load takes it */
+    kw_install(&w, 64); CHECK(kw_check(&w, 0, 1) == MSOTA_KR_NONE); kw_load(&w); CHECK(w.running == 64);
+    /* the restart did not bring the new kernel (the restarted start could not load kernel.bin): no loop, whatever comes next */
+    kw_install(&w, 65); CHECK(kw_check(&w, 1, 1) == MSOTA_KR_GO && w.krst == 65);
+    for (i = 0; i < 5; i++) CHECK(kw_check(&w, 1, 1) == MSOTA_KR_ONCE && w.krst == 65);
+    CHECK(msota_krestart_after(65, 64) == MSOTA_KA_NOT);
+    /* kernel.bin that msota_decide would not start: below the floor, or the rolled-back seq: no restart */
+    memset(&w, 0, sizeof w); w.st.floor = 70; w.st.active = 70; w.kbin = 69; CHECK(kw_check(&w, 1, 1) == MSOTA_KR_NONE);
+    w.st.bad = 71; w.st.floor = 71; w.st.active = 0; w.kbin = 71; CHECK(kw_check(&w, 1, 1) == MSOTA_KR_NONE);
+    /* no kernel.bin (it did not verify, or a rollback renamed it): no restart */
+    w.kbin = 0; CHECK(kw_check(&w, 1, 1) == MSOTA_KR_NONE);
+    /* rollback rules stay: a downloaded kernel that never reached the game twice is dropped by msota_decide, and no restart follows for it */
+    memset(&w, 0, sizeof w); w.kbin = 80; kw_load(&w); w.st.fail = MSOTA_MAX_FAIL; { int action = 0; CHECK(msota_decide(&w.st, 1, 80, 0, &action) == MSOTA_PICK_EMBEDDED && action == 1); } w.kbin = 0;
+    CHECK(kw_check(&w, 1, 1) == MSOTA_KR_NONE);
+    /* no loader file to restart into: no restart, krn.rst untouched */
+    memset(&w, 0, sizeof w); w.kbin = 61; kw_load(&w); kw_install(&w, 62);
+    CHECK(kw_check(&w, 1, 0) == MSOTA_KR_NODOL && w.krst == 0);
+    CHECK(msota_krestart_after(0, 62) == MSOTA_KA_NONE);
+    CHECK(strcmp(msota_krestart_name(MSOTA_KR_ONCE), "already restarted once for it") == 0);
+}
+
+/* the download time rules (ms_dlrule.h), with a simulated link: rate in bytes per ms, stall_at = the byte after which nothing more arrives (0 = never) */
+static int dl_sim(unsigned size, unsigned rate, unsigned stall_at, unsigned head_ms, unsigned deadline, unsigned *end_ms)
+{
+    unsigned t = 0, got = 0, tp = 0;
+    for (;;) {
+        if (t >= head_ms && got < size && (!stall_at || got < stall_at)) { got += rate; if (got > size) got = size; if (stall_at && got > stall_at) got = stall_at; tp = t; }
+        if (got >= size) { *end_ms = t; return 1; }
+        t += 1;
+        if (msdl_expired(t, got ? t - tp : 0u, deadline, got != 0)) { *end_ms = t; return 0; }
+    }
+}
+
+static void test_dlrule(void)
+{
+    unsigned b, e;
+    /* the budget follows the announced size: the 1,916,928-byte shell gets about 56 s, the 221 KB kernel about 13.5 s, never under the floor, never over the cap */
+    b = msdl_budget(1916928u, 30000u); CHECK(b >= 55000u && b <= 57000u);
+    b = msdl_budget(221184u, 12000u); CHECK(b >= 13000u && b <= 14000u);
+    CHECK(msdl_budget(1000u, 30000u) == 30000u);
+    CHECK(msdl_budget(0u, 12000u) == 12000u);
+    CHECK(msdl_budget(200u * 1024u * 1024u, 1000u) == MSDL_CAP_MS);
+    /* the field case: the 1.9 MB shell over a slow link (about 20 KB/s): the old fixed 25.8 s (even with the progress rule) is not enough; the size-based budget is */
+    CHECK(dl_sim(1916928u, 20u, 0u, 1500u, 25806u, &e) == 0);
+    CHECK(dl_sim(1916928u, 20u, 0u, 1500u, msdl_budget(1916928u, 30000u), &e) == 1);
+    /* about 50 KB/s: within the budget itself, no extension needed */
+    CHECK(dl_sim(1916928u, 50u, 0u, 1500u, msdl_budget(1916928u, 30000u), &e) == 1 && e < msdl_budget(1916928u, 30000u));
+    /* slower than the floor rate (30 KB/s), bytes still arriving: it goes on past the deadline (up to twice it) and arrives */
+    b = msdl_budget(1916928u, 30000u);
+    CHECK(dl_sim(1916928u, 30u, 0u, 1500u, b, &e) == 1 && e > b && e < 2u * b);
+    /* a stalled link: half the file, then nothing: it ends MSDL_STALL_MS after the last bytes once the deadline is past, never later */
+    CHECK(dl_sim(1916928u, 50u, 900000u, 1500u, b, &e) == 0 && e >= b && e <= b + MSDL_STALL_MS);
+    /* a stall after the deadline: cut MSDL_STALL_MS after the last bytes */
+    CHECK(dl_sim(1916928u, 20u, 1500000u, 1500u, b, &e) == 0 && e > b && e < 2u * b);
+    /* no body at all (the server never answers): the deadline is hard */
+    CHECK(dl_sim(1000u, 1u, 0u, 1000000u, 5000u, &e) == 0 && e == 5000u);
+    /* the hard end: twice the deadline even while bytes trickle in */
+    CHECK(dl_sim(1916928u, 5u, 0u, 0u, 10000u, &e) == 0 && e == 20000u);
+}
+
 static void test_chain(void)
 {
+    test_krestart();
+    test_dlrule();
     test_restart();
     struct msota_chain_in in;
     char blk[64];

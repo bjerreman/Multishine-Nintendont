@@ -177,9 +177,26 @@ void msota_chain_take(volatile mw2_u32 *m, int *marker, int *late);
    called between polls (the loader: 1 ms).  1 = the kernel answered; 0 = nobody did (the probe word is put back to 0). */
 #define MSOTA_KPROBE 0x4D535052u
 int msota_kernel_probe(volatile mw2_u32 *rs, volatile mw2_u32 *hid_change, volatile mw2_u32 *hid_size, unsigned polls, void (*wait)(void *ctx), void *ctx);
-struct ms_chain_hooks { void (*crumb)(const char *text); void (*shutdown)(void); int full; int late; };   /* late: the machine was already reloaded / patched (see msota_chain_is_late); full: run every teardown step (dev: SD:/multishine/teardown_full) */
+struct ms_chain_hooks { void (*crumb)(const char *text); void (*shutdown)(void); int full; int late; int kreload; };   /* kreload: the restart after a kernel install (early flavour on a machine whose IOS stays: the STM hook is released as on a late hand-over) */   /* late: the machine was already reloaded / patched (see msota_chain_is_late); full: run every teardown step (dev: SD:/multishine/teardown_full) */
 int msota_restart_decide(const struct msota_restart_in *in);
 const char *msota_chain_name(int decision);
+/* The restart for a newer kernel.  When a kernel already runs (this start is a late hand-over: the previous loader's kernel goes on, or the menu is up) and a verified SD:/multishine/kernel.bin is
+   newer than that kernel, the new kernel only starts after a fresh start.  That happens when it was installed after the running kernel was loaded: by this start's boot check, or by an older
+   loader's check in the start that handed over to this one.  The app then restarts once by itself: the running kernel is stopped and the loader is started again in the early flavour, so the
+   new start reloads IOS58 and loads kernel.bin.  A shell installed in the same check is the DOL of that one restart.  The loop guard is SD:/multishine/krn.rst (the kernel seq the last such
+   restart was made for): never twice for one seq.
+   file_seq: the seq of the verified kernel.bin (0 = none, or it does not verify); floor / bad / active: ota.st (active = the seq the last kernel load started; an install sets it to 0, so a
+   kernel installed after the last load never equals it); running: a kernel runs now; marker_seq: krn.rst (0 = absent); dol_ok: a DOL to restart into verifies (the new shell, or this
+   shell's own shell.dol).  -> MSOTA_KR_NONE (no restart needed: no kernel.bin, a kernel.bin msota_decide would refuse (below the floor, the rolled-back seq), or it is the kernel that
+   runs), _GO (restart now, write krn.rst first), _ONCE (already restarted for this seq: never again), _NODOL (no DOL to start). */
+struct msota_krestart_in { mw2_u32 file_seq, floor, bad, active, marker_seq; int running, dol_ok; };
+enum { MSOTA_KR_NONE = 0, MSOTA_KR_GO, MSOTA_KR_ONCE, MSOTA_KR_NODOL };
+int msota_krestart_decide(const struct msota_krestart_in *in);
+/* the first start after such a restart: marker_seq = krn.rst, picked_seq = the kernel this start loads (0 = the embedded one).  -> MSOTA_KA_NONE (no restart was made), _RUNS (the new kernel
+   runs), _NOT (it does not: no second restart, krn.rst stays) */
+enum { MSOTA_KA_NONE = 0, MSOTA_KA_RUNS, MSOTA_KA_NOT };
+int msota_krestart_after(mw2_u32 marker_seq, mw2_u32 picked_seq);
+const char *msota_krestart_name(int decision);
 /* the argument block the stub also builds (stub_main.c restore_args): argv strings NUL terminated plus a final NUL, never more than cap bytes */
 mw2_u32 msota_args_build(char *dst, mw2_u32 cap, int argc, const char *const *argv);
 

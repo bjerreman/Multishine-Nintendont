@@ -2,6 +2,7 @@
 #include <string.h>
 #include "ms_tlsget.h"
 #include "sdhttp.h"
+#include "ms_dlrule.h"
 
 static struct sdtls g_tls;                 /* about 5 KB: static, one session at a time */
 
@@ -34,7 +35,7 @@ static int mstls_do(const struct mstls_net *net, const char *method, const char 
     struct sdhttp_rsp rsp;
     sdc_u8 req_small[400], buf[2048], *req = req_small;
     sdc_u32 req_cap = sizeof req_small;
-    sdc_u32 t0 = net->now(net->ctx), rl, sent = 0, got = 0;
+    sdc_u32 t0 = net->now(net->ctx), rl, sent = 0, got = 0, tp = 0;
     int st, last = -1, r, n, stage = 0;
     memset(res, 0, sizeof *res);
     if (!npins || !pins) return MSTLS_E_NOPIN;
@@ -90,6 +91,7 @@ static int mstls_do(const struct mstls_net *net, const char *method, const char 
                     if (got + bl > res->clen) return MSTLS_E_PROTO;
                     memcpy(res->body + got, body, bl);
                     got += bl;
+                    tp = net->now(net->ctx);                             /* progress: a body that is still arriving is not cut at the deadline (ms_dlrule.h) */
                 }
                 if (used == 0 && !bl) break;
                 p += used; left -= (sdc_u32)used;
@@ -101,7 +103,10 @@ static int mstls_do(const struct mstls_net *net, const char *method, const char 
                 return MSTLS_OK;
             }
         } else if (sent >= rl) net->wait(net->ctx, 2);
-        if ((sdc_u32)(net->now(net->ctx) - t0) >= deadline_ms) return MSTLS_E_TIMEOUT;
+        {
+            sdc_u32 now = net->now(net->ctx);
+            if (msdl_expired((sdc_u32)(now - t0), got ? (sdc_u32)(now - tp) : 0u, deadline_ms, got != 0)) return MSTLS_E_TIMEOUT;
+        }
     }
 }
 

@@ -609,6 +609,33 @@ int msota_restart_decide(const struct msota_restart_in *in)
     return MSOTA_RS_TEXT;
 }
 
+int msota_krestart_decide(const struct msota_krestart_in *in)
+{
+    if (!in->file_seq || !in->running) return MSOTA_KR_NONE;            /* no kernel.bin, or no kernel runs yet (the kernel load of this start takes kernel.bin) */
+    if (in->file_seq < in->floor || in->file_seq == in->bad) return MSOTA_KR_NONE;   /* msota_decide would not start it */
+    if (in->file_seq == in->active) return MSOTA_KR_NONE;              /* it is the kernel that runs */
+    if (in->marker_seq == in->file_seq) return MSOTA_KR_ONCE;          /* a restart for this kernel was made already */
+    if (!in->dol_ok) return MSOTA_KR_NODOL;
+    return MSOTA_KR_GO;
+}
+
+int msota_krestart_after(mw2_u32 marker_seq, mw2_u32 picked_seq)
+{
+    if (!marker_seq) return MSOTA_KA_NONE;
+    return picked_seq == marker_seq ? MSOTA_KA_RUNS : MSOTA_KA_NOT;
+}
+
+const char *msota_krestart_name(int d)
+{
+    switch (d) {
+    case MSOTA_KR_NONE: return "not needed";
+    case MSOTA_KR_GO: return "go";
+    case MSOTA_KR_ONCE: return "already restarted once for it";
+    case MSOTA_KR_NODOL: return "no loader file to restart into";
+    default: return "?";
+    }
+}
+
 int msota_chain_is_late(mw2_u32 guard, mw2_u32 flavour) { return guard == MSOTA_CHAIN_GUARD && flavour == MSOTA_CHAIN_LATE; }
 
 void msota_chain_take(volatile mw2_u32 *m, int *marker, int *late)
