@@ -234,7 +234,7 @@ void vgShutdumpNet(void)
 		dbgprintf("SHUTDUMP: tx hdr %u eth %04X proto %u dst %u.%u.%u.%u:%u from port %u n %u\r\n", i, o->eth, o->proto, o->dip >> 24, (o->dip >> 16) & 255u, (o->dip >> 8) & 255u, o->dip & 255u, o->dport, o->sport, o->n);
 	}
 	for (i = 0; i < V->router.rxsrc_n; i++) dbgprintf("SHUTDUMP: rx src %u from %u.%u.%u.%u:%u n %u\r\n", i, V->router.rxsrc[i].ip >> 24, (V->router.rxsrc[i].ip >> 16) & 255u, (V->router.rxsrc[i].ip >> 8) & 255u, V->router.rxsrc[i].ip & 255u, (u32)V->router.rxsrc[i].port, V->router.rxsrc[i].n);
-	dbgprintf("SHUTDUMP: router maps opened %u evicted %u failed %u\r\n", V->router.st.maps_opened, V->router.st.maps_evicted, V->router.st.maps_failed);
+	dbgprintf("SHUTDUMP: router maps opened %u evicted %u failed %u full %u peak %u of %u | last evicted port %u quiet %u ms\r\n", V->router.st.maps_opened, V->router.st.maps_evicted, V->router.st.maps_failed, V->router.st.maps_full, V->router.st.maps_peak, (u32)VBBA_MAPS, V->router.st.evict_port, V->router.st.evict_idle_ms);
 	for (i = 0; i < VBBA_MAPS; i++) if (V->router.map[i].used) dbgprintf("SHUTDUMP: map %u guest port %u handle %d bound port %u\r\n", i, V->router.map[i].gport, V->router.map[i].h, V->router.tp && V->router.tp->bound_port ? V->router.tp->bound_port(V->router.tp->ctx, V->router.map[i].h) : 0);
 	dbgprintf("SHUTDUMP: router rx delivered %u unsolicited %u (newest from %u.%u.%u.%u:%u) no-lease %u err %u trunc %u\r\n", V->router.st.rx_dgrams, V->router.st.rx_unsolicited, V->router.st.unsol_ip >> 24, (V->router.st.unsol_ip >> 16) & 255u, (V->router.st.unsol_ip >> 8) & 255u, V->router.st.unsol_ip & 255u, (u32)V->router.st.unsol_port, V->router.st.rx_no_lease, V->router.st.rx_err, V->router.st.rx_trunc);
 #ifdef MS_PASSHIST_DUMP
@@ -306,7 +306,7 @@ s = s.replace(b, "\t\t} else if (r->op == VBBA_IOS_TCPPOLL) {     /* revents (or
 c = "\t\tif (r->op == VBBA_IOS_RECVFROM && !VBBA_TP_RXPOLL) continue;"
 assert s.count(c) == 1, "TCP watchdog anchor"
 s = s.replace(c, c + "\n\t\tif (r->op >= VBBA_IOS_TCPSOCKET && r->op <= VBBA_IOS_SHUTDOWN) continue;      /* a slow stream request must never take the network down; the transport has its own deadlines */")
-d = '\tdbgprintf("SHUTDUMP: router maps opened %u evicted %u failed %u\\r\\n", V->router.st.maps_opened, V->router.st.maps_evicted, V->router.st.maps_failed);'
+d = '\tdbgprintf("SHUTDUMP: router maps opened %u evicted %u failed %u full %u peak %u of %u | last evicted port %u quiet %u ms\\r\\n", V->router.st.maps_opened, V->router.st.maps_evicted, V->router.st.maps_failed, V->router.st.maps_full, V->router.st.maps_peak, (u32)VBBA_MAPS, V->router.st.evict_port, V->router.st.evict_idle_ms);'
 if s.count(d) == 1:
     s = s.replace(d, d + '\n\t{ const struct vbba_tcp_stats *q = &V->router.tcp.st; const struct vbba_tp_ios_tcp_stats *w = &V->tp.tst;\n'
       '\t  dbgprintf("SHUTDUMP: tcp syn %u opened %u open_fail %u noslot %u denied %u closed %u rst_tx %u rst_rx %u orphan %u retrans %u ooo %u bad %u\\r\\n", q->syn, q->opened, q->open_fail, q->noslot, q->denied, q->closed, q->rst_tx, q->rst_rx, q->orphan_rst, q->retrans, q->ooo, q->bad);\n'

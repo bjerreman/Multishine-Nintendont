@@ -799,6 +799,91 @@ static void test_mac_swap(void)
     rig_close(&G);
 }
 
+/* ---- many guest ports: the game socket, the server session, a port that only receives and short-lived test ports ------------------------- */
+/* the router's backend with a count of the datagrams handed to the guest, by guest port (the guest's sdnet has 4 sockets: the frames go to the backend directly) */
+static unsigned g_port_rx[65536];
+static const struct vbba_frame_backend *rbe(void) { return vbba_router_backend(&G.router); }
+static int w_caps(void *c, struct vbba_frame_caps *o) { (void)c; return rbe()->get_capabilities(rbe()->context, o); }
+static int w_tx(void *c, const vbba_u8 *f, vbba_u16 n) { (void)c; return rbe()->submit_tx(rbe()->context, f, n); }
+static int w_rx(void *c, vbba_u8 *f, vbba_u16 cap, vbba_u16 *n)
+{
+    int rc = rbe()->receive_rx(rbe()->context, f, cap, n);
+    (void)c;
+    if (rc == VBBA_OK && *n >= 42 && g16(f + 12) == 0x0800 && f[23] == 17) g_port_rx[g16(f + 36)]++;
+    return rc;
+}
+static int w_poll(void *c) { (void)c; return rbe()->poll(rbe()->context); }
+static void w_reset(void *c) { (void)c; rbe()->reset(rbe()->context); }
+static const struct vbba_frame_backend W_BE = { 0, w_caps, w_tx, w_rx, w_poll, w_reset };
+
+static void port_send(unsigned port, unsigned *sent)
+{
+    vbba_u8 pay[16], f[128];
+    int n;
+    memset(pay, (int)(port & 0xffu), sizeof pay);
+    n = mk_udp(f, G.S.ip, ECHO_FAR, port, 7, pay, (int)sizeof pay);
+    CHECK(G.be->submit_tx(G.be->context, f, (vbba_u16)n) == VBBA_OK);
+    if (sent) (*sent)++;
+}
+
+static void test_many_ports(void)
+{
+    struct vbba_router_cfg rc;
+    enum { NACT = 3, NTEST = 12 };
+    static const unsigned act[NACT] = { 43441, 43150, 44000 };   /* game socket, server session (both send every 100 ms), the third only receives (pushed every 500 ms) */
+    unsigned sent[NACT] = { 0 }, push = 0, tsent[NTEST] = { 0 }, ms, k;
+    vbba_u8 pay[16];
+    printf("-- many guest ports: %u maps, %u IOS sockets; 3 long-lived ports (one receive-only) and %u short test ports, one new every 3 s\n",
+           (unsigned)VBBA_MAPS, (unsigned)VBBA_TP_IOS_SOCKS, (unsigned)NTEST);
+    memset(g_port_rx, 0, sizeof g_port_rx); memset(pay, 0x33, sizeof pay);
+    rig_router_cfg(&rc, VBBA_RF_ICMP);
+    G.use_dma = 1; G.stub = RIG_STUB_PATCHED; G.split3 = 0; G.interleave = 1;
+    rig_setup(&G, 0, MOCK_MEM, WII_IP, &rc, VBBA_CHIP_AUTH, &W_BE);
+    G.io.echo_ip = ECHO_FAR; G.io.latency_ms = 5;                           /* a close takes 5 ms in IOS: an evicted socket is still busy when its replacement opens */
+    CHECK(rig_bringup(&G, 1) == BBA_OK && dhcp_until(10000) > 0);
+    port_send(act[2], 0);                                                    /* the receive-only port: one datagram out (conntrack), then only pushes in */
+    rig_run(&G, 20);
+    memset(g_port_rx, 0, sizeof g_port_rx);
+    for (ms = 0; ms < 3000u * NTEST + 12000u; ms += 10) {
+        if (ms % 100 == 0) { port_send(act[0], &sent[0]); port_send(act[1], &sent[1]); }
+        if (ms % 500 == 0) { (void)mock_ios_inject(&G.io, (vbba_u16)act[2], ECHO_FAR, 7, pay, sizeof pay); push++; }   /* no socket on the port any more (evicted): the push is lost */
+        k = ms / 3000u;
+        if (k < NTEST && ms % 3000u < 300u && ms % 100u == 0) port_send(50000u + k, &tsent[k]);   /* a test port: three datagrams, then quiet */
+        rig_run(&G, 10);
+    }
+    rig_run(&G, 50);
+    printf("   game %u/%u, server %u/%u, receive-only %u/%u replies; maps opened %u evicted %u failed %u full %u peak %u, newest eviction port %u quiet %u ms\n",
+           g_port_rx[act[0]], sent[0], g_port_rx[act[1]], sent[1], g_port_rx[act[2]], push, G.router.st.maps_opened, G.router.st.maps_evicted,
+           G.router.st.maps_failed, G.router.st.maps_full, G.router.st.maps_peak, G.router.st.evict_port, G.router.st.evict_idle_ms);
+    CHECK(g_port_rx[act[0]] == sent[0] && g_port_rx[act[1]] == sent[1] && g_port_rx[act[2]] == push);
+    for (k = 0; k < NTEST; k++) { CHECK(g_port_rx[50000u + k] == tsent[k]); if (g_port_rx[50000u + k] != tsent[k]) printf("   test port %u: %u/%u\n", 50000u + k, g_port_rx[50000u + k], tsent[k]); }
+    CHECK(G.router.st.maps_evicted >= 1 && G.router.st.maps_failed == 0 && G.router.st.maps_full == 0 && G.router.st.evict_port >= 50000u);
+    CHECK(G.router.st.evict_idle_ms >= VBBA_MAP_KEEP_MS && G.router.st.maps_peak <= VBBA_MAPS);
+    rig_close(&G);
+
+    /* more active ports than maps: the established ones keep every reply, the extra one is refused (counted), nothing active is evicted */
+    rig_setup(&G, 0, MOCK_MEM, WII_IP, &rc, VBBA_CHIP_AUTH, &W_BE);
+    G.io.echo_ip = ECHO_FAR; G.io.latency_ms = 5;
+    CHECK(rig_bringup(&G, 1) == BBA_OK && dhcp_until(10000) > 0);
+    memset(g_port_rx, 0, sizeof g_port_rx);
+    {
+        unsigned s2[VBBA_MAPS + 1], i, ok = 1;
+        memset(s2, 0, sizeof s2);
+        for (ms = 0; ms < 20000u; ms += 10) {
+            if (ms % 200 == 0) for (i = 0; i < VBBA_MAPS; i++) port_send(40000u + i, &s2[i]);
+            if (ms >= 1000u && ms % 200 == 100) port_send(40000u + VBBA_MAPS, &s2[VBBA_MAPS]);
+            rig_run(&G, 10);
+        }
+        rig_run(&G, 50);
+        for (i = 0; i < VBBA_MAPS; i++) if (g_port_rx[40000u + i] != s2[i]) { ok = 0; printf("   active port %u: %u/%u\n", 40000u + i, g_port_rx[40000u + i], s2[i]); }
+        printf("   %u ports active at once + 1 more: established replies %s, extra port %u/%u delivered, refused %u times, evicted %u\n",
+               (unsigned)VBBA_MAPS, ok ? "all delivered" : "LOST", g_port_rx[40000u + VBBA_MAPS], s2[VBBA_MAPS], G.router.st.maps_full, G.router.st.maps_evicted);
+        CHECK(ok && G.router.st.maps_evicted == 0 && G.router.st.maps_full >= 1 && g_port_rx[40000u + VBBA_MAPS] == 0);
+    }
+    rig_close(&G);
+    printf("   many ports: no active port lost a reply, quiet ports evicted, an extra port never takes an active map: done\n");
+}
+
 int main(void)
 {
 #if VBBA_TP_RXPOLL
@@ -824,6 +909,7 @@ int main(void)
     test_ios();
     test_send_path();
     test_mac_swap();
+    test_many_ports();
     printf("%d checks, %d failures\n", g_checks, g_fail);
     return g_fail != 0;
 }

@@ -7,7 +7,7 @@
 #include "vbba_ios.h"
 
 #ifndef VBBA_TP_IOS_SOCKS
-#define VBBA_TP_IOS_SOCKS 4
+#define VBBA_TP_IOS_SOCKS 10             /* the router's VBBA_MAPS (8) plus two: a socket the router evicted is still closing in IOS while its replacement opens */
 #endif
 #ifndef VBBA_TP_NONBLOCK
 #define VBBA_TP_NONBLOCK 0               /* 1 (b14a): sockets are made non-blocking and receives are polled every VBBA_TP_RX_POLL_MS, so no blocking recvfrom sits in IOS in front of the sendtos */

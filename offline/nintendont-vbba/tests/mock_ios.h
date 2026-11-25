@@ -8,7 +8,7 @@
 
 #define MOCK_MEM 0
 #define MOCK_UDP 1
-#define MOCK_FDS 8
+#define MOCK_FDS 16
 #define MOCK_RXQ 32
 #define MOCK_PEND 64
 

@@ -10,7 +10,8 @@
  *            No answer until the lease address is known; the DISCOVER is kept (one, newest wins) and offered the moment the address is
  *            there (before, the guest only got its lease at its next retry: 2, 6, 14, 30 s after its start; 14.05 s and 30.06 s on the Wii).
  *   UDP out  allow-listed destinations only (default: nothing); source must be the leased address; one transport
- *            socket per guest source port (bound to the same port when the platform allows); conntrack entry.
+ *            socket per guest source port (bound to the same port when the platform allows); conntrack entry.  With every
+ *            map taken, a new port evicts the least recently used one, never one with traffic within VBBA_MAP_KEEP_MS.
  *   UDP in   datagrams from a conntrack peer (or, with OPEN_INBOUND, from an allow-listed one) become frames with
  *            IPv4/UDP headers and checksums addressed to the guest.
  *   ICMP     echo requests to the router address are answered (VBBA_RF_ICMP); everything else is dropped.
@@ -27,7 +28,10 @@
 #include "vbba_tcp.h"
 
 #ifndef VBBA_MAPS
-#define VBBA_MAPS 4                    /* guest source ports with a transport socket */
+#define VBBA_MAPS 8                    /* guest source ports with a transport socket (the game, its resolver and each network test bind ports of their own) */
+#endif
+#ifndef VBBA_MAP_KEEP_MS
+#define VBBA_MAP_KEEP_MS 10000u        /* a map with traffic either way in this window is never evicted: a new port waits for a quiet one instead */
 #endif
 #ifndef VBBA_CT
 #define VBBA_CT 16                     /* conntrack entries (map, remote ip, remote port) */
@@ -81,6 +85,9 @@ struct vbba_router_stats {
     vbba_u32 maps_opened, maps_evicted, maps_failed;
     vbba_u32 tx_dns;                     /* guest UDP datagrams to port 53 (counted before any allow/deny decision; diagnostic) */
     vbba_u32 tx_f_arp, tx_f_udp, tx_f_ip_other, tx_f_nonip;   /* (diagnostic): every frame the guest transmitted, by type (before any validation) */
+    vbba_u32 maps_full;                  /* a new guest port found every map active (traffic within VBBA_MAP_KEEP_MS): its datagram dropped, nothing evicted */
+    vbba_u32 maps_peak;                  /* most maps in use at once */
+    vbba_u32 evict_port, evict_idle_ms;  /* the newest eviction: the guest port and how long it had been quiet */
 };
 
 /* (diagnostic): the first VBBA_TXHDR distinct frame headers the guest transmitted (key: ethertype, ip protocol, destination ip, destination port) */
@@ -89,7 +96,7 @@ struct vbba_txhdr { vbba_u16 eth, sport, dport, len; vbba_u8 proto, op; vbba_u32
 #define VBBA_RXSRC 6
 struct vbba_rxsrc { vbba_u32 ip, n; vbba_u16 port; };                                  /* source address of delivered datagrams, with a count (test builds print it) */
 
-struct vbba_map { vbba_u8 used; vbba_u16 gport; int h; vbba_u32 last; };
+struct vbba_map { vbba_u8 used; vbba_u16 gport; int h; vbba_u32 last; };   /* last: newest datagram either way */
 struct vbba_ct { vbba_u8 used, map; vbba_u16 port; vbba_u32 ip, last; };
 
 struct vbba_router {

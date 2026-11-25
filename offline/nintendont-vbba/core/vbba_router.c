@@ -199,26 +199,36 @@ static void on_dhcp(struct vbba_router *r, const vbba_u8 *m, vbba_u32 n, vbba_u3
 }
 
 /* ---- port maps and conntrack ---- */
+static void map_drop(struct vbba_router *r, int i)
+{
+    int h;
+    if (r->tp->close) r->tp->close(r->tp->ctx, r->map[i].h);
+    r->map[i].used = 0;
+    for (h = 0; h < VBBA_CT; h++) if (r->ct[h].map == i) r->ct[h].used = 0;
+#if VBBA_HOLD
+    if (r->hold_used && r->hold_map == i) { r->hold_used = 0; r->st.tx_hold_drop++; }
+#endif
+}
+
 static int map_for(struct vbba_router *r, vbba_u16 gport, vbba_u32 t)
 {
-    int i, lru = -1, h;
+    int i, lru = -1, h, n = 0;
     for (i = 0; i < VBBA_MAPS; i++) if (r->map[i].used && r->map[i].gport == gport) { r->map[i].last = t; return i; }
     for (i = 0; i < VBBA_MAPS; i++) if (!r->map[i].used) break;
-    if (i == VBBA_MAPS) {                                            /* evict the least recently used */
+    if (i == VBBA_MAPS) {                                            /* evict the least recently used, if it has been quiet */
         for (i = 0; i < VBBA_MAPS; i++) if (lru < 0 || (vbba_s32)(r->map[i].last - r->map[lru].last) < 0) lru = i;
-        i = lru;
-        if (r->tp->close) r->tp->close(r->tp->ctx, r->map[i].h);
-        r->map[i].used = 0;
-        for (h = 0; h < VBBA_CT; h++) if (r->ct[h].map == i) r->ct[h].used = 0;
-#if VBBA_HOLD
-        if (r->hold_used && r->hold_map == i) { r->hold_used = 0; r->st.tx_hold_drop++; }
-#endif
+        if ((vbba_u32)(t - r->map[lru].last) < VBBA_MAP_KEEP_MS) { r->st.maps_full++; return -1; }
+        r->st.evict_port = r->map[lru].gport; r->st.evict_idle_ms = t - r->map[lru].last;
+        map_drop(r, lru);
         r->st.maps_evicted++;
+        i = lru;
     }
     h = r->tp->open(r->tp->ctx, gport);
-    if (h < 0) { r->st.maps_failed++; return -1; }
+    if (h < 0) { r->st.maps_failed++; return -1; }                  /* the slot stays free: the port's next datagram tries again */
     r->map[i].used = 1; r->map[i].gport = gport; r->map[i].h = h; r->map[i].last = t;
     r->st.maps_opened++;
+    for (h = 0; h < VBBA_MAPS; h++) n += r->map[h].used;
+    if ((vbba_u32)n > r->st.maps_peak) r->st.maps_peak = (vbba_u32)n;
     return i;
 }
 
@@ -296,8 +306,7 @@ static void on_udp(struct vbba_router *r, const vbba_u8 *f, vbba_u32 ihl, vbba_u
             return;
         }
         if (s2 != VBBA_TP_OPEN && !queued_by_tp) {
-            if (r->tp->close) r->tp->close(r->tp->ctx, r->map[m].h);
-            r->map[m].used = 0; r->st.maps_failed++; r->st.tx_tp_err++;
+            map_drop(r, m); r->st.maps_failed++; r->st.tx_tp_err++;  /* the port's next datagram opens a new socket */
             return;
         }
     }
@@ -419,6 +428,7 @@ static int be_rx(void *ctx, vbba_u8 *f, vbba_u16 cap, vbba_u16 *len)
             continue;
         }
         r->st.rx_dgrams++;
+        m->last = t;                                                 /* a port that only receives is in use too */
         { vbba_u32 q; for (q = 0; q < r->rxsrc_n; q++) if (r->rxsrc[q].ip == ip && r->rxsrc[q].port == port) { r->rxsrc[q].n++; break; }
           if (q == r->rxsrc_n && r->rxsrc_n < VBBA_RXSRC) { r->rxsrc[q].ip = ip; r->rxsrc[q].port = port; r->rxsrc[q].n = 1; r->rxsrc_n++; } }
         *len = (vbba_u16)build_udp(r, f, r->guest_mac, ip, r->leased, port, m->gport, (vbba_u32)n);
